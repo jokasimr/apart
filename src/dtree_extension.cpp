@@ -73,11 +73,19 @@ struct FixedNode {
 };
 
 template <class T, idx_t N>
+struct ImplicitFixedNode {
+	T coefficients[N];
+	T threshold;
+};
+
+template <class T, idx_t N>
 struct FixedTree final : CompiledTree {
 	explicit FixedTree(const ParsedTree &tree) : CompiledTree(tree, N) {
 	}
 
 	vector<FixedNode<T, N>> nodes;
+	vector<ImplicitFixedNode<T, N>> implicit_nodes;
+	vector<sel_t> implicit_leaves;
 };
 
 template <class T>
@@ -365,6 +373,36 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 }
 
 template <class T, idx_t N>
+static void MakeImplicitTopology(FixedTree<T, N> &tree) {
+	auto nodes = std::move(tree.nodes);
+	vector<uint32_t> references;
+	references.reserve(nodes.size() * 2 + 1);
+	references.push_back(tree.root);
+	tree.implicit_nodes.reserve(nodes.size());
+
+	for (idx_t node_idx = 0; node_idx < nodes.size(); node_idx++) {
+		auto reference = references[node_idx];
+		D_ASSERT(!IsLeaf(reference));
+		auto &source = nodes[reference];
+		tree.implicit_nodes.emplace_back();
+		auto &target = tree.implicit_nodes.back();
+		for (idx_t feature = 0; feature < N; feature++) {
+			target.coefficients[feature] = source.coefficients[feature];
+		}
+		target.threshold = source.threshold;
+		references.push_back(source.children[0]);
+		references.push_back(source.children[1]);
+	}
+
+	tree.implicit_leaves.reserve(nodes.size() + 1);
+	for (idx_t leaf = nodes.size(); leaf < references.size(); leaf++) {
+		D_ASSERT(IsLeaf(references[leaf]));
+		tree.implicit_leaves.push_back(LeafIndex(references[leaf]));
+	}
+	tree.root = 0;
+}
+
+template <class T, idx_t N>
 static shared_ptr<CompiledTree> CompileFixedTree(const ParsedTree &tree) {
 	auto result = make_shared_ptr<FixedTree<T, N>>(tree);
 	CompileTopology(tree, *result, [&](FixedTree<T, N> &target_tree, uint32_t target, idx_t source) {
@@ -375,6 +413,9 @@ static shared_ptr<CompiledTree> CompileFixedTree(const ParsedTree &tree) {
 			    ReadNumber<T>(tree.coefficients[source][feature_idx], "coefficients", source);
 		}
 	});
+	if (result->depth != VARIABLE_DEPTH) {
+		MakeImplicitTopology(*result);
+	}
 	return result;
 }
 
@@ -442,7 +483,8 @@ struct GenericArrayInput {
 
 template <idx_t FEATURE, class T, idx_t N, class INPUT>
 struct FixedScore {
-	static inline void Accumulate(T &score, const FixedNode<T, N> &node, const INPUT &input, idx_t row) {
+	template <class NODE>
+	static inline void Accumulate(T &score, const NODE &node, const INPUT &input, idx_t row) {
 		score += node.coefficients[FEATURE] * input.Get(FEATURE, row);
 		FixedScore<FEATURE + 1, T, N, INPUT>::Accumulate(score, node, input, row);
 	}
@@ -450,7 +492,8 @@ struct FixedScore {
 
 template <class T, idx_t N, class INPUT>
 struct FixedScore<N, T, N, INPUT> {
-	static inline void Accumulate(T &, const FixedNode<T, N> &, const INPUT &, idx_t) {
+	template <class NODE>
+	static inline void Accumulate(T &, const NODE &, const INPUT &, idx_t) {
 	}
 };
 
@@ -460,6 +503,15 @@ static inline uint32_t AdvanceFixed(const FixedNode<T, N> *nodes, const INPUT &i
 	T score = 0;
 	FixedScore<0, T, N, INPUT>::Accumulate(score, node, input, row);
 	return node.children[static_cast<idx_t>(score >= node.threshold)];
+}
+
+template <class T, idx_t N, class INPUT>
+static inline uint32_t AdvanceImplicitFixed(const ImplicitFixedNode<T, N> *nodes, const INPUT &input, idx_t row,
+                                            uint32_t reference) {
+	auto &node = nodes[reference];
+	T score = 0;
+	FixedScore<0, T, N, INPUT>::Accumulate(score, node, input, row);
+	return 2 * reference + 1 + static_cast<uint32_t>(score >= node.threshold);
 }
 
 template <idx_t LANE, class T, idx_t N, class INPUT>
@@ -489,42 +541,66 @@ static inline void AdvanceFixedActive(const FixedNode<T, N> *nodes, const INPUT 
 }
 
 template <idx_t LANE, class T, idx_t N, class INPUT>
-static inline void AdvanceFixedLane(const FixedNode<T, N> *nodes, const INPUT &input, idx_t row,
-                                    uint32_t (&references)[BLOCK_SIZE]) {
-	references[LANE] = AdvanceFixed(nodes, input, row + LANE, references[LANE]);
+static inline void AdvanceImplicitFixedLane(const ImplicitFixedNode<T, N> *nodes, const INPUT &input, idx_t row,
+                                            uint32_t (&references)[BLOCK_SIZE]) {
+	references[LANE] = AdvanceImplicitFixed(nodes, input, row + LANE, references[LANE]);
 }
 
 template <class T, idx_t N, class INPUT>
-static inline void AdvanceFixedBlock(const FixedNode<T, N> *nodes, const INPUT &input, idx_t row,
-                                     uint32_t (&references)[BLOCK_SIZE]) {
-	AdvanceFixedLane<0>(nodes, input, row, references);
-	AdvanceFixedLane<1>(nodes, input, row, references);
-	AdvanceFixedLane<2>(nodes, input, row, references);
-	AdvanceFixedLane<3>(nodes, input, row, references);
-	AdvanceFixedLane<4>(nodes, input, row, references);
-	AdvanceFixedLane<5>(nodes, input, row, references);
-	AdvanceFixedLane<6>(nodes, input, row, references);
-	AdvanceFixedLane<7>(nodes, input, row, references);
+static inline void AdvanceImplicitFixedBlock(const ImplicitFixedNode<T, N> *nodes, const INPUT &input, idx_t row,
+                                             uint32_t (&references)[BLOCK_SIZE]) {
+	AdvanceImplicitFixedLane<0>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<1>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<2>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<3>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<4>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<5>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<6>(nodes, input, row, references);
+	AdvanceImplicitFixedLane<7>(nodes, input, row, references);
+}
+
+template <class T, idx_t N, class INPUT>
+static void EvaluateImplicitFixedTree(const FixedTree<T, N> &tree, const INPUT &input, idx_t count,
+                                      sel_t *leaf_indices) {
+	auto nodes = tree.implicit_nodes.data();
+	auto node_count = tree.implicit_nodes.size();
+	idx_t row = 0;
+	for (; row + BLOCK_SIZE <= count; row += BLOCK_SIZE) {
+		uint32_t references[BLOCK_SIZE] {};
+		for (uint32_t level = 0; level < tree.depth; level++) {
+			AdvanceImplicitFixedBlock(nodes, input, row, references);
+		}
+		for (idx_t lane = 0; lane < BLOCK_SIZE; lane++) {
+			leaf_indices[row + lane] = tree.implicit_leaves[references[lane] - node_count];
+		}
+	}
+
+	for (; row < count; row++) {
+		uint32_t reference = 0;
+		for (uint32_t level = 0; level < tree.depth; level++) {
+			reference = AdvanceImplicitFixed(nodes, input, row, reference);
+		}
+		leaf_indices[row] = tree.implicit_leaves[reference - node_count];
+	}
 }
 
 template <class T, idx_t N, class INPUT>
 static void EvaluateFixedTree(const FixedTree<T, N> &tree, const INPUT &input, idx_t count, sel_t *leaf_indices) {
+	if (tree.depth != VARIABLE_DEPTH) {
+		EvaluateImplicitFixedTree(tree, input, count, leaf_indices);
+		return;
+	}
+
 	auto nodes = tree.nodes.data();
 	idx_t row = 0;
 	for (; row + BLOCK_SIZE <= count; row += BLOCK_SIZE) {
 		uint32_t references[BLOCK_SIZE] {tree.root, tree.root, tree.root, tree.root,
 		                                 tree.root, tree.root, tree.root, tree.root};
-		if (tree.depth == VARIABLE_DEPTH) {
-			uint8_t active = IsLeaf(tree.root) ? 0 : UINT8_C(0xff);
-			while (active) {
-				uint8_t next_active = 0;
-				AdvanceFixedActive(nodes, input, row, active, references, next_active);
-				active = next_active;
-			}
-		} else {
-			for (uint32_t level = 0; level < tree.depth; level++) {
-				AdvanceFixedBlock(nodes, input, row, references);
-			}
+		uint8_t active = IsLeaf(tree.root) ? 0 : UINT8_C(0xff);
+		while (active) {
+			uint8_t next_active = 0;
+			AdvanceFixedActive(nodes, input, row, active, references, next_active);
+			active = next_active;
 		}
 		for (idx_t lane = 0; lane < BLOCK_SIZE; lane++) {
 			leaf_indices[row + lane] = LeafIndex(references[lane]);

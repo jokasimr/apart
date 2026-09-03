@@ -31,6 +31,13 @@ To measure only the extension implementation:
 python3 benchmark/run_extension_benchmark.py --duckdb build/release/duckdb
 ```
 
+The small-feature benchmark measures balanced trees with one, two, and three `FLOAT` features at depths 3, 5, 7,
+and 9:
+
+```sh
+python3 benchmark/run_small_feature_benchmark.py --duckdb build/release/duckdb
+```
+
 The micro-batching experiment is a separate, self-contained C++ benchmark with no DuckDB dependency:
 
 ```sh

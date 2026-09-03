@@ -66,17 +66,18 @@ At bind time, `dtree`:
 - requires and evaluates the constant tree expression;
 - validates dimensions, field lengths, references, reachability, cycles, and tree topology;
 - promotes `FLOAT` and `DOUBLE` parameters and features to one computation type;
-- rewrites nodes into depth-first order and packs their parameters and child references into typed execution arrays;
+- rewrites nodes into typed execution arrays;
 - records whether every leaf has the same depth;
 - selects a `FLOAT` or `DOUBLE` kernel specialized for feature counts one through five, or a runtime-size kernel for
   larger counts;
 - removes the constant tree argument from runtime execution.
 
-Fixed-size kernels store each node's coefficients directly beside its threshold and topology. The general evaluator
-stores coefficients feature-major and loops over the runtime dimension. Both advance eight independent rows together
-so the processor can overlap their otherwise dependent traversals. Trees whose leaves all have the same depth use a
-fixed-depth loop; other shapes track which rows have reached a leaf. The left/right choice itself is branchless. The
-separate-column and fixed-array interfaces share the same traversal implementations.
+For fixed feature counts, equal-depth trees are stored in heap order with only coefficients and thresholds; the kernel
+computes each child index directly. Other fixed-size trees retain explicit child references in depth-first order. The
+general evaluator stores coefficients feature-major and loops over the runtime dimension. All kernels advance eight
+independent rows together so the processor can overlap their otherwise dependent traversals. Trees whose leaves all
+have the same depth use a fixed-depth loop; other shapes track which rows have reached a leaf. The left/right choice
+itself is branchless. The separate-column and fixed-array interfaces share the same traversal implementations.
 
 Traversal writes leaf indices into one reusable selection buffer allocated by DuckDB's function-local initialization.
 After traversal, results with fewer than `STANDARD_VECTOR_SIZE / 2` authored leaves use that selection as a dictionary

@@ -277,6 +277,32 @@ FROM (VALUES (-1.0::FLOAT), (5.0::FLOAT), (10.0::FLOAT)) features(x);
 20
 30
 
+# Equal-depth trees use implicit topology while preserving authored leaf identities.
+query I
+SELECT decision_tree(
+    {
+        coefficients: [[0.0::FLOAT, 1.0::FLOAT], [0.0::FLOAT, 1.0::FLOAT], [1.0::FLOAT, 0.0::FLOAT]],
+        thresholds: [0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT],
+        left_children: [-1, -2, 0],
+        right_children: [-2, -3, 1],
+        leaf_values: [10, 20, 30],
+        root: 2
+    },
+    x,
+    y
+)
+FROM (VALUES
+    (-1.0::FLOAT, -1.0::FLOAT),
+    (-1.0::FLOAT, 1.0::FLOAT),
+    (1.0::FLOAT, -1.0::FLOAT),
+    (1.0::FLOAT, 1.0::FLOAT)
+) features(x, y);
+----
+10
+20
+20
+30
+
 # Different bound trees must not be merged by common-subexpression elimination.
 query II
 SELECT

@@ -118,3 +118,29 @@ row-wise and micro-batched evaluators use the same explicit child references and
 | 16 | 10 | 158.63 | 0.85 | 15.86 | 2.22x |
 | 32 | 10 | 176.25 | 1.32 | 17.63 | 2.00x |
 | 64 | 10 | 200.19 | 1.03 | 20.02 | 1.76x |
+
+## Child-free implicit topology
+
+For fixed feature counts, equal-depth trees were converted at bind time from explicit child references into heap-order
+nodes containing only coefficients and thresholds. Runtime traversal computes `2 * node + 1 + decision`; a final
+lookup maps the heap leaf position back to the authored leaf identity. The comparison uses balanced trees, `FLOAT`
+features, and `INTEGER` leaves. Each result is the median of 21 single-threaded runs over 10,000,000 rows after three
+warmups. All checksums were stable.
+
+| Features | Depth | Explicit ns/row | Implicit ns/row | Time reduction |
+|---:|---:|---:|---:|---:|
+| 1 | 3 | 4.10 | 4.10 | 0.0% |
+| 1 | 5 | 5.60 | 5.30 | 5.4% |
+| 1 | 7 | 7.50 | 6.70 | 10.7% |
+| 1 | 9 | 10.40 | 9.30 | 10.6% |
+| 2 | 3 | 5.00 | 4.90 | 2.0% |
+| 2 | 5 | 6.80 | 6.50 | 4.4% |
+| 2 | 7 | 9.00 | 8.50 | 5.6% |
+| 2 | 9 | 12.70 | 12.00 | 5.5% |
+| 3 | 3 | 6.10 | 5.90 | 3.3% |
+| 3 | 5 | 8.40 | 8.00 | 4.8% |
+| 3 | 7 | 11.20 | 10.50 | 6.3% |
+| 3 | 9 | 12.60 | 11.70 | 7.1% |
+
+The depth-3 differences are close to the timing dispersion and should not be interpreted strongly. The depth-5 to
+depth-9 reductions are larger and consistent across all three feature counts.
