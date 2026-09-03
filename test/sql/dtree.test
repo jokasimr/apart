@@ -4,16 +4,20 @@
 
 require dtree
 
-# score = x0; negative values select leaf 0. Non-negative values continue to
-# score = x1, which selects leaf 1 below 10 and leaf 2 at or above 10.
+# score = x0; negative values return 10. Non-negative values continue to
+# score = x1, which returns 20 below 10 and 30 at or above 10.
 query I
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT, 0.0::FLOAT], [0.0::FLOAT, 1.0::FLOAT]],
-        thresholds: [0.0::FLOAT, 10.0::FLOAT],
-        left_children: [-1, -2],
-        right_children: [1, -3],
-        leaf_values: [10, 20, 30]
+        weights: [1, 0],
+        threshold: 0,
+        below: {value: 10},
+        above: {
+            weights: [0, 1],
+            threshold: 10,
+            below: {value: 20},
+            above: {value: 30}
+        }
     },
     x,
     y
@@ -25,14 +29,32 @@ FROM (VALUES (-1.0::FLOAT, 100.0::FLOAT), (1.0::FLOAT, 5.0::FLOAT), (1.0::FLOAT,
 20
 30
 
+# The affine predicate is score >= threshold; NaN makes it false.
 query I
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT, 0.0::FLOAT], [0.0::FLOAT, 1.0::FLOAT]],
-        thresholds: [0.0::FLOAT, 10.0::FLOAT],
-        left_children: [-1, -2],
-        right_children: [1, -3],
-        leaf_values: [10, 20, 30]
+        weights: [1],
+        threshold: 0,
+        below: {value: 10},
+        above: {value: 20}
+    },
+    'NaN'::FLOAT
+);
+----
+10
+
+query I
+SELECT decision_tree(
+    {
+        weights: [1, 0],
+        threshold: 0,
+        below: {value: 10},
+        above: {
+            weights: [0, 1],
+            threshold: 10,
+            below: {value: 20},
+            above: {value: 30}
+        }
     },
     [x, y]::FLOAT[2]
 )
@@ -46,14 +68,15 @@ FROM (VALUES (-1.0::FLOAT, 100.0::FLOAT), (1.0::FLOAT, 5.0::FLOAT), (1.0::FLOAT,
 # Both overloads handle DuckDB's non-flat and nullable vector representations.
 statement ok
 CREATE MACRO generic_test_tree() AS {
-    coefficients: [
-        [1.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT],
-        [0.0::FLOAT, 1.0::FLOAT, 0.0::FLOAT]
-    ],
-    thresholds: [0.0::FLOAT, 0.0::FLOAT],
-    left_children: [-1, -2],
-    right_children: [1, -3],
-    leaf_values: [10, 20, 30]
+    weights: [1, 0, 0],
+    threshold: 0,
+    below: {value: 10},
+    above: {
+        weights: [0, 1, 0],
+        threshold: 0,
+        below: {value: 20},
+        above: {value: 30}
+    }
 };
 
 query T
@@ -62,22 +85,62 @@ FROM range(4096) rows(i);
 ----
 DICTIONARY_VECTOR
 
-# The threshold counts authored leaves, even when their values are equal.
+# The output threshold counts authored leaves, even when every value is equal.
 statement ok
-CREATE MACRO dictionary_boundary_tree() AS {
-    coefficients: list_transform(range(1023), lambda i: [0.0::FLOAT]),
-    thresholds: list_transform(range(1023), lambda i: 0.0::FLOAT),
-    left_children: list_transform(range(1023), lambda i:
-        CASE WHEN 2 * i + 1 < 1023 THEN (2 * i + 1)::INTEGER ELSE (1022 - (2 * i + 1))::INTEGER END
-    ),
-    right_children: list_transform(range(1023), lambda i:
-        CASE WHEN 2 * i + 2 < 1023 THEN (2 * i + 2)::INTEGER ELSE (1022 - (2 * i + 2))::INTEGER END
-    ),
-    leaf_values: list_transform(range(1024), lambda i: 0)
+CREATE MACRO repeated_leaf_0(v) AS {value: v};
+
+statement ok
+CREATE MACRO repeated_leaf_1(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_0(v), above: repeated_leaf_0(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_2(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_1(v), above: repeated_leaf_1(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_3(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_2(v), above: repeated_leaf_2(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_4(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_3(v), above: repeated_leaf_3(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_5(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_4(v), above: repeated_leaf_4(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_6(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_5(v), above: repeated_leaf_5(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_7(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_6(v), above: repeated_leaf_6(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_8(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_7(v), above: repeated_leaf_7(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_9(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_8(v), above: repeated_leaf_8(v)
+};
+
+statement ok
+CREATE MACRO repeated_leaf_10(v) AS {
+    weights: [0], threshold: 0, below: repeated_leaf_9(v), above: repeated_leaf_9(v)
 };
 
 query T
-SELECT DISTINCT vector_type(decision_tree(dictionary_boundary_tree(), i::FLOAT))
+SELECT DISTINCT vector_type(decision_tree(repeated_leaf_10(0), i::FLOAT))
 FROM range(4096) rows(i);
 ----
 FLAT_VECTOR
@@ -101,15 +164,20 @@ WHERE decision_tree(generic_test_tree(), x)
 # Exercise the fixed-depth three-feature kernels for column and ARRAY inputs.
 statement ok
 CREATE MACRO fixed_depth_test_tree() AS {
-    coefficients: [
-        [1.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT],
-        [0.0::FLOAT, 1.0::FLOAT, 0.0::FLOAT],
-        [0.0::FLOAT, 0.0::FLOAT, 1.0::FLOAT]
-    ],
-    thresholds: [0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT],
-    left_children: [1, -1, -3],
-    right_children: [2, -2, -4],
-    leaf_values: [10, 20, 30, 40]
+    weights: [1, 0, 0],
+    threshold: 0,
+    below: {
+        weights: [0, 1, 0],
+        threshold: 0,
+        below: {value: 10},
+        above: {value: 20}
+    },
+    above: {
+        weights: [0, 0, 1],
+        threshold: 0,
+        below: {value: 30},
+        above: {value: 40}
+    }
 };
 
 query I
@@ -131,41 +199,37 @@ query TTTT
 SELECT
     decision_tree(
         {
-            coefficients: [[1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE]],
-            thresholds: [10.0::DOUBLE],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: ['low', 'high']
+            weights: [1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE],
+            threshold: 10,
+            below: {value: 'low'},
+            above: {value: 'high'}
         },
         1.0::DOUBLE, 2.0::DOUBLE, 3.0::DOUBLE, 4.0::DOUBLE
     ),
     decision_tree(
         {
-            coefficients: [[1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT]],
-            thresholds: [16.0::FLOAT],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: ['low', 'high']
+            weights: [1, 1, 1, 1, 1],
+            threshold: 16,
+            below: {value: 'low'},
+            above: {value: 'high'}
         },
         [1, 2, 3, 4, 5]::FLOAT[5]
     ),
     decision_tree(
         {
-            coefficients: [[1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT, 1.0::FLOAT]],
-            thresholds: [21.0::FLOAT],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: ['low', 'high']
+            weights: [1, 1, 1, 1, 1, 1],
+            threshold: 21,
+            below: {value: 'low'},
+            above: {value: 'high'}
         },
         1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT, 4.0::FLOAT, 5.0::FLOAT, 6.0::FLOAT
     ),
     decision_tree(
         {
-            coefficients: [[1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE]],
-            thresholds: [22.0::DOUBLE],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: ['low', 'high']
+            weights: [1, 1, 1, 1, 1, 1],
+            threshold: 22,
+            below: {value: 'low'},
+            above: {value: 'high'}
         },
         [1, 2, 3, 4, 5, 6]::DOUBLE[6]
     );
@@ -175,14 +239,15 @@ high	low	high	low
 # The generic kernel handles variable-depth topology for column and array inputs.
 statement ok
 CREATE MACRO generic_six_tree() AS {
-    coefficients: [
-        [1.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT],
-        [0.0::FLOAT, 1.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT]
-    ],
-    thresholds: [0.0::FLOAT, 0.0::FLOAT],
-    left_children: [-1, -2],
-    right_children: [1, -3],
-    leaf_values: ['left', 'middle', 'right']
+    weights: [1, 0, 0, 0, 0, 0],
+    threshold: 0,
+    below: {value: 'left'},
+    above: {
+        weights: [0, 1, 0, 0, 0, 0],
+        threshold: 0,
+        below: {value: 'middle'},
+        above: {value: 'right'}
+    }
 };
 
 query I
@@ -209,14 +274,10 @@ SELECT result.label, result.payload[1], result.payload[2]
 FROM (
     SELECT decision_tree(
         {
-            coefficients: [[1.0::DOUBLE]],
-            thresholds: [0.0::DOUBLE],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: [
-                {label: 'negative', payload: [10, 11]},
-                {label: 'positive', payload: [20, 21]}
-            ]
+            weights: [1],
+            threshold: 0,
+            below: {value: {label: 'negative', payload: [10, 11]}},
+            above: {value: {label: 'positive', payload: [20, 21]}}
         },
         x
     ) AS result
@@ -230,11 +291,10 @@ positive	20	21
 query I
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT]],
-        thresholds: [0.0::FLOAT],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [NULL::INTEGER, 42]
+        weights: [1],
+        threshold: 0,
+        below: {value: NULL},
+        above: {value: 42}
     },
     x
 ) IS NULL
@@ -247,27 +307,29 @@ true
 query T
 SELECT typeof(decision_tree(
     {
-        coefficients: [[1.0::FLOAT]],
-        thresholds: [0.0::FLOAT],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [10, 20]
+        weights: [1],
+        threshold: 0,
+        below: {value: 10},
+        above: {value: 20}
     },
     NULL::FLOAT
 ));
 ----
 INTEGER
 
-# The authored topology may use a nonzero root and arbitrary node order.
+# Variable-depth trees are expressed directly rather than through node indices.
 query I
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT], [1.0::FLOAT]],
-        thresholds: [10.0::FLOAT, 0.0::FLOAT],
-        left_children: [-2, -1],
-        right_children: [-3, 0],
-        leaf_values: [10, 20, 30],
-        root: 1
+        weights: [1],
+        threshold: 0,
+        below: {value: 10},
+        above: {
+            weights: [1],
+            threshold: 10,
+            below: {value: 20},
+            above: {value: 30}
+        }
     },
     x
 )
@@ -277,16 +339,24 @@ FROM (VALUES (-1.0::FLOAT), (5.0::FLOAT), (10.0::FLOAT)) features(x);
 20
 30
 
-# Equal-depth trees use implicit topology while preserving authored leaf identities.
+# Equal-depth trees use implicit topology while preserving repeated leaf values.
 query I
 SELECT decision_tree(
     {
-        coefficients: [[0.0::FLOAT, 1.0::FLOAT], [0.0::FLOAT, 1.0::FLOAT], [1.0::FLOAT, 0.0::FLOAT]],
-        thresholds: [0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT],
-        left_children: [-1, -2, 0],
-        right_children: [-2, -3, 1],
-        leaf_values: [10, 20, 30],
-        root: 2
+        weights: [1, 0],
+        threshold: 0,
+        below: {
+            weights: [0, 1],
+            threshold: 0,
+            below: {value: 10},
+            above: {value: 20}
+        },
+        above: {
+            weights: [0, 1],
+            threshold: 0,
+            below: {value: 20},
+            above: {value: 30}
+        }
     },
     x,
     y
@@ -308,21 +378,19 @@ query II
 SELECT
     decision_tree(
         {
-            coefficients: [[1.0::FLOAT]],
-            thresholds: [0.0::FLOAT],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: [10, 20]
+            weights: [1],
+            threshold: 0,
+            below: {value: 10},
+            above: {value: 20}
         },
         x
     ),
     decision_tree(
         {
-            coefficients: [[1.0::FLOAT]],
-            thresholds: [0.0::FLOAT],
-            left_children: [-1],
-            right_children: [-2],
-            leaf_values: [30, 40]
+            weights: [1],
+            threshold: 0,
+            below: {value: 30},
+            above: {value: 40}
         },
         x
     )
@@ -334,14 +402,7 @@ FROM (VALUES (-1.0::FLOAT), (1.0::FLOAT)) features(x);
 # A tree can consist of one leaf and no internal nodes.
 query I
 SELECT decision_tree(
-    {
-        coefficients: []::FLOAT[][],
-        thresholds: []::FLOAT[],
-        left_children: []::INTEGER[],
-        right_children: []::INTEGER[],
-        leaf_values: [42],
-        root: -1
-    },
+    {value: 42},
     123.0::FLOAT
 );
 ----
@@ -351,11 +412,10 @@ SELECT decision_tree(
 statement error
 SELECT decision_tree(tree_value, 1.0::FLOAT)
 FROM (VALUES ({
-    coefficients: [[1.0::FLOAT]],
-    thresholds: [0.0::FLOAT],
-    left_children: [-1],
-    right_children: [-2],
-    leaf_values: [0, 1]
+    weights: [1],
+    threshold: 0,
+    below: {value: 0},
+    above: {value: 1}
 })) trees(tree_value);
 ----
 <REGEX>:.+
@@ -363,11 +423,10 @@ FROM (VALUES ({
 statement error
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT, 2.0::FLOAT]],
-        thresholds: [0.0::FLOAT],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [0, 1]
+        weights: [1, 2],
+        threshold: 0,
+        below: {value: 0},
+        above: {value: 1}
     },
     1.0::FLOAT
 );
@@ -377,11 +436,9 @@ SELECT decision_tree(
 statement error
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT]],
-        thresholds: [0.0::FLOAT],
-        left_children: [0],
-        right_children: [-1],
-        leaf_values: [0]
+        weights: [1],
+        threshold: 0,
+        below: {value: 0}
     },
     1.0::FLOAT
 );
@@ -392,51 +449,94 @@ SELECT decision_tree(
 query IT
 SELECT decision_tree(
     {
-        coefficients: [[1.0::DOUBLE]],
-        thresholds: [0.0::FLOAT],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [0::BIGINT, 1::BIGINT]
+        weights: [1.0::DOUBLE],
+        threshold: 0,
+        below: {value: 0::BIGINT},
+        above: {value: 1::BIGINT}
     },
     1.0::FLOAT
 ), typeof(decision_tree(
     {
-        coefficients: [[1.0::FLOAT]],
-        thresholds: [0.0::DOUBLE],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: ['left', 'right']
+        weights: [1],
+        threshold: 0.0::DOUBLE,
+        below: {value: 'left'},
+        above: {value: 'right'}
     },
     1.0::DOUBLE
 ));
 ----
 1	VARCHAR
 
-# Other numeric parameter and feature types are rejected.
-statement error
+# Ordinary numeric literals in the tree are converted to the feature computation type.
+query TT
 SELECT decision_tree(
     {
-        coefficients: [[1]],
-        thresholds: [0.0::FLOAT],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [0, 1]
+        weights: [1],
+        threshold: 0.5,
+        below: {value: 0},
+        above: {value: 1.5}
     },
     1.0::FLOAT
-);
+), typeof(decision_tree(
+    {
+        weights: [1],
+        threshold: 0,
+        below: {value: 0},
+        above: {value: 1.5}
+    },
+    1.0::FLOAT
+));
 ----
-<REGEX>:.+
+1.5	DECIMAL(11,1)
 
+# Feature columns remain restricted to FLOAT and DOUBLE.
 statement error
 SELECT decision_tree(
     {
-        coefficients: [[1.0::FLOAT]],
-        thresholds: [0.0::FLOAT],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [0, 1]
+        weights: [1],
+        threshold: 0,
+        below: {value: 0},
+        above: {value: 1}
     },
     1
 );
 ----
 <REGEX>:.+
+
+# Node and leaf shapes are exact, and errors identify the authored path.
+statement error
+SELECT decision_tree(
+    {
+        weights: [1],
+        threshold: 0,
+        below: {value: 0, extra: 1},
+        above: {value: 1}
+    },
+    1.0::FLOAT
+);
+----
+<REGEX>:.*tree.below.*only.*value.*
+
+statement error
+SELECT decision_tree(
+    {
+        weights: [1],
+        threshold: 0,
+        below: {
+            weights: [1, 2],
+            threshold: 0,
+            below: {value: 0},
+            above: {value: 1}
+        },
+        above: {value: 2}
+    },
+    1.0::FLOAT
+);
+----
+<REGEX>:.*tree.below.weights.*2 values.*1 features.*
+
+# Untyped NULL leaves need another leaf to establish the common result type.
+statement error
+SELECT decision_tree({value: NULL}, 1.0::FLOAT);
+----
+<REGEX>:.*leaf values must have a concrete type.*

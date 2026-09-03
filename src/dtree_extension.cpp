@@ -39,8 +39,8 @@ struct ParsedTree {
 	vector<int64_t> left_children;
 	vector<int64_t> right_children;
 	vector<Value> leaf_values;
-	LogicalType coefficient_type;
-	LogicalType threshold_type;
+	vector<string> node_paths;
+	LogicalType parameter_type;
 	LogicalType leaf_type;
 	int64_t root;
 };
@@ -132,19 +132,9 @@ struct DecisionTreeLocalState final : FunctionLocalState {
 	vector<const T *> features;
 };
 
-static const LogicalType &SequenceChildType(const LogicalType &type, const string &field_name) {
-	if (type.id() == LogicalTypeId::LIST) {
-		return ListType::GetChildType(type);
-	}
-	if (type.id() == LogicalTypeId::ARRAY) {
-		return ArrayType::GetChildType(type);
-	}
-	throw BinderException("decision_tree tree field '%s' must be a LIST or ARRAY, not %s", field_name, type.ToString());
-}
-
-static const vector<Value> &SequenceValues(const Value &value, const string &field_name) {
+static const vector<Value> &SequenceValues(const Value &value, const string &path) {
 	if (value.IsNull()) {
-		throw BinderException("decision_tree tree field '%s' cannot be NULL", field_name);
+		throw BinderException("decision_tree %s cannot be NULL", path);
 	}
 	if (value.type().id() == LogicalTypeId::LIST) {
 		return ListValue::GetChildren(value);
@@ -152,8 +142,7 @@ static const vector<Value> &SequenceValues(const Value &value, const string &fie
 	if (value.type().id() == LogicalTypeId::ARRAY) {
 		return ArrayValue::GetChildren(value);
 	}
-	throw BinderException("decision_tree tree field '%s' must be a LIST or ARRAY, not %s", field_name,
-	                      value.type().ToString());
+	throw BinderException("decision_tree %s must be a LIST or ARRAY, not %s", path, value.type().ToString());
 }
 
 static optional_idx FindStructField(const child_list_t<LogicalType> &fields, const string &name) {
@@ -165,10 +154,10 @@ static optional_idx FindStructField(const child_list_t<LogicalType> &fields, con
 	return optional_idx();
 }
 
-static idx_t RequireStructField(const child_list_t<LogicalType> &fields, const string &name) {
+static idx_t RequireStructField(const child_list_t<LogicalType> &fields, const string &name, const string &path) {
 	auto result = FindStructField(fields, name);
 	if (!result.IsValid()) {
-		throw BinderException("decision_tree tree STRUCT is missing required field '%s'", name);
+		throw BinderException("decision_tree %s is missing required field '%s'", path, name);
 	}
 	return result.GetIndex();
 }
@@ -182,104 +171,127 @@ static void RequireFloatingType(const LogicalType &type, const string &descripti
 	}
 }
 
-static int64_t ReadChildReference(const Value &value, const string &field_name, idx_t index) {
-	if (value.IsNull()) {
-		throw BinderException("decision_tree tree field '%s' contains NULL at index %llu", field_name, index);
+static void IncludeCommonType(LogicalType &current, const LogicalType &type, const string &path) {
+	LogicalType combined;
+	if (!LogicalType::TryGetMaxLogicalTypeUnchecked(current, type, combined)) {
+		throw BinderException("decision_tree %s has type %s, which cannot be combined with %s", path, type.ToString(),
+		                      current.ToString());
 	}
-	try {
-		return value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-	} catch (Exception &ex) {
-		throw BinderException("decision_tree tree field '%s' contains an invalid child reference at index %llu: %s",
-		                      field_name, index, ex.what());
-	}
+	current = std::move(combined);
 }
 
-static ParsedTree ParseTreeValue(const Value &tree_value) {
-	if (tree_value.IsNull()) {
-		throw BinderException("decision_tree tree argument cannot be NULL");
+static void IncludeParameterType(LogicalType &current, const LogicalType &type, const string &path) {
+	if (!type.IsNumeric()) {
+		throw BinderException("decision_tree %s must be numeric, not %s", path, type.ToString());
 	}
-	if (tree_value.type().id() != LogicalTypeId::STRUCT) {
-		throw BinderException("decision_tree first argument must be a constant STRUCT, not %s",
-		                      tree_value.type().ToString());
+	IncludeCommonType(current, type, path);
+}
+
+class TreeParser {
+public:
+	explicit TreeParser(const Value &tree_value) {
+		result.parameter_type = LogicalType::SQLNULL;
+		result.leaf_type = LogicalType::SQLNULL;
+		result.root = ParseSubtree(tree_value, "tree");
+		if (result.leaf_type.id() == LogicalTypeId::SQLNULL || result.leaf_type.id() == LogicalTypeId::UNKNOWN) {
+			throw BinderException(
+			    "decision_tree leaf values must have a concrete type; cast at least one NULL value to "
+			    "the desired result type");
+		}
+		for (idx_t leaf = 0; leaf < result.leaf_values.size(); leaf++) {
+			try {
+				result.leaf_values[leaf] = result.leaf_values[leaf].DefaultCastAs(result.leaf_type);
+			} catch (Exception &ex) {
+				throw BinderException("decision_tree %s cannot be converted to the common leaf type %s: %s",
+				                      leaf_paths[leaf], result.leaf_type.ToString(), ex.what());
+			}
+		}
 	}
 
-	auto &fields = StructType::GetChildTypes(tree_value.type());
-	auto &values = StructValue::GetChildren(tree_value);
-	auto coefficients_idx = RequireStructField(fields, "coefficients");
-	auto thresholds_idx = RequireStructField(fields, "thresholds");
-	auto left_idx = RequireStructField(fields, "left_children");
-	auto right_idx = RequireStructField(fields, "right_children");
-	auto leaves_idx = RequireStructField(fields, "leaf_values");
-	auto root_idx = FindStructField(fields, "root");
-
-	auto &coefficient_rows = SequenceValues(values[coefficients_idx], "coefficients");
-	auto &threshold_values = SequenceValues(values[thresholds_idx], "thresholds");
-	auto &left_values = SequenceValues(values[left_idx], fields[left_idx].first);
-	auto &right_values = SequenceValues(values[right_idx], fields[right_idx].first);
-	auto &leaf_values = SequenceValues(values[leaves_idx], fields[leaves_idx].first);
-
-	auto coefficient_row_type = SequenceChildType(fields[coefficients_idx].second, "coefficients");
-	auto coefficient_type = SequenceChildType(coefficient_row_type, "coefficients row");
-	auto threshold_type = SequenceChildType(fields[thresholds_idx].second, "thresholds");
-	auto left_type = SequenceChildType(fields[left_idx].second, fields[left_idx].first);
-	auto right_type = SequenceChildType(fields[right_idx].second, fields[right_idx].first);
-	auto leaf_type = SequenceChildType(fields[leaves_idx].second, fields[leaves_idx].first);
-
-	RequireFloatingType(coefficient_type, "coefficients");
-	RequireFloatingType(threshold_type, "thresholds");
-	if (!left_type.IsIntegral() || !right_type.IsIntegral()) {
-		throw BinderException("decision_tree child references must use integer types (found %s and %s)",
-		                      left_type.ToString(), right_type.ToString());
-	}
-	if (root_idx.IsValid() && !fields[root_idx.GetIndex()].second.IsIntegral()) {
-		throw BinderException("decision_tree root reference must use an integer type, not %s",
-		                      fields[root_idx.GetIndex()].second.ToString());
-	}
-	if (leaf_type.id() == LogicalTypeId::SQLNULL || leaf_type.id() == LogicalTypeId::UNKNOWN) {
-		throw BinderException("decision_tree leaf_values must have a concrete type; cast an all-NULL or empty list to "
-		                      "the desired result type");
+	ParsedTree TakeResult() {
+		return std::move(result);
 	}
 
-	auto node_count = coefficient_rows.size();
-	if (threshold_values.size() != node_count || left_values.size() != node_count ||
-	    right_values.size() != node_count) {
-		throw BinderException("decision_tree coefficients, thresholds, left_children, and right_children must have "
-		                      "the same number of entries");
+private:
+	int64_t ParseSubtree(const Value &subtree, const string &path) {
+		if (subtree.IsNull()) {
+			throw BinderException("decision_tree %s must be a node or leaf, not NULL", path);
+		}
+		if (subtree.type().id() != LogicalTypeId::STRUCT) {
+			throw BinderException("decision_tree %s must be a node or leaf STRUCT, not %s", path,
+			                      subtree.type().ToString());
+		}
+
+		auto &fields = StructType::GetChildTypes(subtree.type());
+		auto &values = StructValue::GetChildren(subtree);
+		auto value_idx = FindStructField(fields, "value");
+		if (value_idx.IsValid()) {
+			if (fields.size() != 1) {
+				throw BinderException("decision_tree leaf %s must contain only the field 'value'", path);
+			}
+			return AddLeaf(values[value_idx.GetIndex()], path + ".value");
+		}
+
+		auto weights_idx = RequireStructField(fields, "weights", path);
+		auto threshold_idx = RequireStructField(fields, "threshold", path);
+		auto below_idx = RequireStructField(fields, "below", path);
+		auto above_idx = RequireStructField(fields, "above", path);
+		if (fields.size() != 4) {
+			throw BinderException(
+			    "decision_tree node %s must contain exactly 'weights', 'threshold', 'below', and 'above'", path);
+		}
+		if (result.coefficients.size() >= LEAF_MASK) {
+			throw BinderException("decision_tree supports fewer than %u internal nodes", LEAF_MASK);
+		}
+
+		auto &weight_values = SequenceValues(values[weights_idx], path + ".weights");
+		vector<Value> weights;
+		weights.reserve(weight_values.size());
+		for (idx_t weight = 0; weight < weight_values.size(); weight++) {
+			auto weight_path = path + ".weights[" + to_string(weight + 1) + "]";
+			if (weight_values[weight].IsNull()) {
+				throw BinderException("decision_tree %s cannot be NULL", weight_path);
+			}
+			IncludeParameterType(result.parameter_type, weight_values[weight].type(), weight_path);
+			weights.push_back(weight_values[weight]);
+		}
+
+		auto &threshold = values[threshold_idx];
+		if (threshold.IsNull()) {
+			throw BinderException("decision_tree %s.threshold cannot be NULL", path);
+		}
+		IncludeParameterType(result.parameter_type, threshold.type(), path + ".threshold");
+
+		auto node = result.coefficients.size();
+		result.coefficients.push_back(std::move(weights));
+		result.thresholds.push_back(threshold);
+		result.left_children.push_back(0);
+		result.right_children.push_back(0);
+		result.node_paths.push_back(path);
+		auto below = ParseSubtree(values[below_idx], path + ".below");
+		auto above = ParseSubtree(values[above_idx], path + ".above");
+		result.left_children[node] = below;
+		result.right_children[node] = above;
+		return UnsafeNumericCast<int64_t>(node);
 	}
-	if (leaf_values.empty()) {
-		throw BinderException("decision_tree leaf_values must contain at least one value");
-	}
-	if (node_count >= LEAF_MASK || leaf_values.size() >= LEAF_MASK) {
-		throw BinderException("decision_tree supports fewer than %u internal nodes and leaf values", LEAF_MASK);
+
+	int64_t AddLeaf(const Value &value, const string &path) {
+		if (result.leaf_values.size() >= LEAF_MASK) {
+			throw BinderException("decision_tree supports fewer than %u leaves", LEAF_MASK);
+		}
+		IncludeCommonType(result.leaf_type, value.type(), path);
+		auto leaf = result.leaf_values.size();
+		result.leaf_values.push_back(value);
+		leaf_paths.push_back(path);
+		return -UnsafeNumericCast<int64_t>(leaf) - 1;
 	}
 
 	ParsedTree result;
-	result.thresholds = threshold_values;
-	result.leaf_values = leaf_values;
-	result.coefficient_type = std::move(coefficient_type);
-	result.threshold_type = std::move(threshold_type);
-	result.leaf_type = std::move(leaf_type);
-	result.coefficients.reserve(node_count);
-	result.left_children.reserve(node_count);
-	result.right_children.reserve(node_count);
+	vector<string> leaf_paths;
+};
 
-	for (idx_t node_idx = 0; node_idx < node_count; node_idx++) {
-		result.coefficients.emplace_back(SequenceValues(coefficient_rows[node_idx], "coefficients row"));
-		result.left_children.push_back(ReadChildReference(left_values[node_idx], fields[left_idx].first, node_idx));
-		result.right_children.push_back(ReadChildReference(right_values[node_idx], fields[right_idx].first, node_idx));
-	}
-
-	if (root_idx.IsValid()) {
-		result.root = ReadChildReference(values[root_idx.GetIndex()], "root", 0);
-	} else if (node_count == 0) {
-		if (leaf_values.size() != 1) {
-			throw BinderException("decision_tree with no internal nodes requires a root field identifying the leaf");
-		}
-		result.root = -1;
-	} else {
-		result.root = 0;
-	}
-	return result;
+static ParsedTree ParseTreeValue(const Value &tree_value) {
+	return TreeParser(tree_value).TakeResult();
 }
 
 static void ValidateDimensions(const ParsedTree &tree, idx_t dimensions) {
@@ -288,21 +300,22 @@ static void ValidateDimensions(const ParsedTree &tree, idx_t dimensions) {
 	}
 	for (idx_t node_idx = 0; node_idx < tree.coefficients.size(); node_idx++) {
 		if (tree.coefficients[node_idx].size() != dimensions) {
-			throw BinderException("decision_tree coefficients row %llu has %llu values, but the invocation has %llu "
-			                      "features",
-			                      node_idx, tree.coefficients[node_idx].size(), dimensions);
+			throw BinderException("decision_tree %s.weights has %llu values, but the invocation has %llu features",
+			                      tree.node_paths[node_idx], tree.coefficients[node_idx].size(), dimensions);
 		}
 	}
 }
 
 template <class T>
-static T ReadNumber(const Value &value, const string &field_name, idx_t index) {
-	if (value.IsNull()) {
-		throw BinderException("decision_tree tree field '%s' contains NULL at index %llu", field_name, index);
+static T ReadNumber(const Value &value, const string &path) {
+	LogicalType target_type = std::is_same<T, float>::value ? LogicalType::FLOAT : LogicalType::DOUBLE;
+	try {
+		auto cast_value = value.DefaultCastAs(target_type);
+		return cast_value.template GetValue<T>();
+	} catch (Exception &ex) {
+		throw BinderException("decision_tree %s cannot be converted to %s: %s", path, target_type.ToString(),
+		                      ex.what());
 	}
-	auto target_type = std::is_same<T, float>::value ? LogicalType::FLOAT : LogicalType::DOUBLE;
-	auto cast_value = value.DefaultCastAs(target_type);
-	return cast_value.template GetValue<T>();
 }
 
 template <class TREE, class INITIALIZE_NODE>
@@ -407,10 +420,11 @@ static shared_ptr<CompiledTree> CompileFixedTree(const ParsedTree &tree) {
 	auto result = make_shared_ptr<FixedTree<T, N>>(tree);
 	CompileTopology(tree, *result, [&](FixedTree<T, N> &target_tree, uint32_t target, idx_t source) {
 		auto &node = target_tree.nodes[target];
-		node.threshold = ReadNumber<T>(tree.thresholds[source], "thresholds", source);
+		node.threshold = ReadNumber<T>(tree.thresholds[source], tree.node_paths[source] + ".threshold");
 		for (idx_t feature_idx = 0; feature_idx < N; feature_idx++) {
 			node.coefficients[feature_idx] =
-			    ReadNumber<T>(tree.coefficients[source][feature_idx], "coefficients", source);
+			    ReadNumber<T>(tree.coefficients[source][feature_idx],
+			                  tree.node_paths[source] + ".weights[" + to_string(feature_idx + 1) + "]");
 		}
 	});
 	if (result->depth != VARIABLE_DEPTH) {
@@ -426,10 +440,11 @@ static shared_ptr<CompiledTree> CompileGenericTree(const ParsedTree &tree, idx_t
 	result->coefficients.resize(node_count * dimensions);
 	CompileTopology(tree, *result, [&](GenericTree<T> &target_tree, uint32_t target, idx_t source) {
 		auto &node = target_tree.nodes[target];
-		node.threshold = ReadNumber<T>(tree.thresholds[source], "thresholds", source);
+		node.threshold = ReadNumber<T>(tree.thresholds[source], tree.node_paths[source] + ".threshold");
 		for (idx_t feature_idx = 0; feature_idx < dimensions; feature_idx++) {
 			target_tree.coefficients[feature_idx * node_count + target] =
-			    ReadNumber<T>(tree.coefficients[source][feature_idx], "coefficients", source);
+			    ReadNumber<T>(tree.coefficients[source][feature_idx],
+			                  tree.node_paths[source] + ".weights[" + to_string(feature_idx + 1) + "]");
 		}
 	});
 	return result;
@@ -921,20 +936,19 @@ static void ConfigureFunction(ScalarFunction &function, idx_t dimensions, bool a
 	}
 }
 
-static void IncludeComputationType(const LogicalType &type, const string &description, bool &use_double) {
-	RequireFloatingType(type, description);
-	use_double |= type == LogicalType::DOUBLE;
-}
-
 static LogicalType ConfigureTypes(ScalarFunction &function, const ParsedTree &tree, idx_t dimensions, bool array_input,
                                   const vector<LogicalType> &feature_types) {
-	bool use_double = false;
-	IncludeComputationType(tree.coefficient_type, "coefficients", use_double);
-	IncludeComputationType(tree.threshold_type, "thresholds", use_double);
+	auto computation_type = tree.parameter_type;
 	for (auto &feature_type : feature_types) {
-		IncludeComputationType(feature_type, "features", use_double);
+		RequireFloatingType(feature_type, "features");
+		LogicalType combined;
+		if (!LogicalType::TryGetMaxLogicalTypeUnchecked(computation_type, feature_type, combined)) {
+			throw BinderException("decision_tree parameters of type %s cannot be combined with features of type %s",
+			                      computation_type.ToString(), feature_type.ToString());
+		}
+		computation_type = std::move(combined);
 	}
-	auto computation_type = use_double ? LogicalType::DOUBLE : LogicalType::FLOAT;
+	D_ASSERT(computation_type == LogicalType::FLOAT || computation_type == LogicalType::DOUBLE);
 
 	function.return_type = tree.leaf_type;
 	function.varargs = LogicalType(LogicalTypeId::INVALID);
@@ -946,7 +960,7 @@ static LogicalType ConfigureTypes(ScalarFunction &function, const ParsedTree &tr
 			argument = computation_type;
 		}
 	}
-	if (use_double) {
+	if (computation_type == LogicalType::DOUBLE) {
 		ConfigureFunction<double>(function, dimensions, array_input);
 	} else {
 		ConfigureFunction<float>(function, dimensions, array_input);

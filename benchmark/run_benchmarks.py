@@ -86,21 +86,16 @@ def make_tree(depth, seed):
     return Tree(coefficients, thresholds, left_children, right_children)
 
 
-def tree_literal(tree):
-    coefficient_rows = (
-        list_literal(float_literal(weight) for weight in weights)
-        for weights in tree.coefficients
+def tree_literal(tree, reference=0):
+    if reference < 0:
+        return f"{{value:{-reference - 1}}}"
+    weights = list_literal(float_literal(value) for value in tree.coefficients[reference])
+    below = tree_literal(tree, tree.left_children[reference])
+    above = tree_literal(tree, tree.right_children[reference])
+    return (
+        f"{{weights:{weights},threshold:{float_literal(tree.thresholds[reference])},"
+        f"below:{below},above:{above}}}"
     )
-    return "{" + ",".join(
-        (
-            "coefficients:" + list_literal(coefficient_rows),
-            "thresholds:"
-            + list_literal(float_literal(value) for value in tree.thresholds),
-            "left_children:" + list_literal(tree.left_children),
-            "right_children:" + list_literal(tree.right_children),
-            "leaf_values:" + list_literal(range(len(tree.left_children) + 1)),
-        )
-    ) + "}"
 
 
 def reference_expression(tree, reference=0):
