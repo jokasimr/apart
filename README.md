@@ -7,8 +7,9 @@ decision_tree(tree, x1, x2, ..., xn) -> T
 decision_tree(tree, features_array)   -> T
 ```
 
-The tree is a constant DuckDB `STRUCT`. Its dimensionality and leaf result type are resolved during binding. The
-second form requires a fixed-size DuckDB `ARRAY`; its length supplies the dimensionality.
+The tree is a constant DuckDB `STRUCT`. Coefficients, thresholds, and features may be `FLOAT` or `DOUBLE`; mixed
+inputs are evaluated as `DOUBLE`. `T` is the element type of `leaf_values` and may be any concrete DuckDB logical
+type. The second form requires a fixed-size array whose length supplies the dimensionality.
 
 ## Tree representation
 
@@ -20,7 +21,7 @@ The authoring representation is a columnar `STRUCT` with these fields:
 | `thresholds` | `LIST`/`ARRAY` of `FLOAT` or `DOUBLE` | One threshold per internal node. |
 | `left_children` | integer `LIST`/`ARRAY` | Child selected when the affine score is below the threshold. |
 | `right_children` | integer `LIST`/`ARRAY` | Child selected when the affine score is at or above the threshold. |
-| `leaf_values` | `LIST`/`ARRAY` of `T` | The typed values returned by the tree. |
+| `leaf_values` | `LIST`/`ARRAY` of `T` | The values returned by the tree. |
 | `root` | integer, optional | Root reference; defaults to internal node `0`. |
 
 A nonnegative child reference is an internal-node index. A negative reference identifies leaf `-(reference + 1)`:
@@ -39,11 +40,11 @@ Example:
 ```sql
 SELECT decision_tree(
     {
-        coefficients: [[1.0::DOUBLE, 0.0::DOUBLE], [0.0::DOUBLE, 1.0::DOUBLE]],
-        thresholds: [0.0::DOUBLE, 10.0::DOUBLE],
+        coefficients: [[1.0::FLOAT, 0.0::FLOAT], [0.0::FLOAT, 1.0::FLOAT]],
+        thresholds: [0.0::FLOAT, 10.0::FLOAT],
         left_children: [-1, -2],
         right_children: [1, -3],
-        leaf_values: ['negative x', 'small y', 'large y']
+        leaf_values: [10, 20, 30]
     },
     x,
     y
@@ -54,26 +55,7 @@ FROM feature_table;
 The equivalent fixed-array call is:
 
 ```sql
-SELECT decision_tree(tree_struct, [x, y]::DOUBLE[2])
-FROM feature_table;
-```
-
-Leaf values may have any common DuckDB logical type, including nested types:
-
-```sql
-SELECT decision_tree(
-    {
-        coefficients: [[1.0::DOUBLE]],
-        thresholds: [0.0::DOUBLE],
-        left_children: [-1],
-        right_children: [-2],
-        leaf_values: [
-            {label: 'negative', payload: [10, 11]},
-            {label: 'positive', payload: [20, 21]}
-        ]
-    },
-    x
-)
+SELECT decision_tree(tree_struct, [x, y]::FLOAT[2])
 FROM feature_table;
 ```
 
@@ -83,29 +65,32 @@ At bind time, `dtree`:
 
 - requires and evaluates the constant tree expression;
 - validates dimensions, field lengths, references, reachability, cycles, and tree topology;
-- determines the result type from `leaf_values`;
-- selects `FLOAT` or `DOUBLE` as the computation type and inserts feature casts;
-- rewrites internal nodes into depth-first order and packs their coefficients, threshold, and child references;
-- selects the `FLOAT` or `DOUBLE` evaluator.
+- promotes `FLOAT` and `DOUBLE` parameters and features to one computation type;
+- rewrites nodes into depth-first order and packs their parameters and child references into typed execution arrays;
+- records whether every leaf has the same depth;
+- selects a `FLOAT` or `DOUBLE` kernel specialized for feature counts one through five, or a runtime-size kernel for
+  larger counts;
+- removes the constant tree argument from runtime execution.
 
-The baseline evaluator stores coefficients in a compact node-major array and loops over the dimensions at each visited
-node. Both the separate-column and fixed `ARRAY` interfaces use this path. Dimension-specific kernels and further
-low-level optimizations are intentionally deferred until they can be guided by benchmarks.
+Fixed-size kernels store each node's coefficients directly beside its threshold and topology. The general evaluator
+stores coefficients feature-major and loops over the runtime dimension. Both advance eight independent rows together
+so the processor can overlap their otherwise dependent traversals. Trees whose leaves all have the same depth use a
+fixed-depth loop; other shapes track which rows have reached a leaf. The left/right choice itself is branchless. The
+separate-column and fixed-array interfaces share the same traversal implementations.
 
-The evaluator reads DuckDB vectors through unified vector formats and returns a dictionary selection over the bound
-leaf vector. This avoids reconstructing variable-width or nested leaf values per row. A NULL feature, NULL feature
-array, or NULL array element produces NULL.
+Traversal writes leaf indices into one reusable selection buffer allocated by DuckDB's function-local initialization.
+After traversal, results with fewer than `STANDARD_VECTOR_SIZE / 2` authored leaves use that selection as a dictionary
+over the leaf vector; larger leaf sets are copied to a flat result. The decision uses the number of leaves, without
+comparing or deduplicating their values. This keeps arbitrary leaf types, including strings and nested values, entirely
+outside the numerical loop. The extension performs no allocation in traversal or per-chunk allocation for its scratch
+state. Flattening encoded inputs and constructing variable-sized flat outputs may use DuckDB-managed allocations
+outside traversal.
 
 ### Numeric types
 
-Coefficients, thresholds, and features must be `FLOAT` or `DOUBLE`. The computation type is selected with two simple
-rules:
-
-- all-`FLOAT` inputs and tree parameters compute as `FLOAT`;
-- the presence of any `DOUBLE` input or tree parameter promotes computation to `DOUBLE`.
-
-Other numeric types are rejected rather than converted implicitly. They can be cast explicitly by the caller when
-loss of range or precision is acceptable.
+Coefficients, thresholds, and features must be `FLOAT` or `DOUBLE`. If any of them is `DOUBLE`, all parameters and
+features are evaluated by the `DOUBLE` kernel; otherwise the `FLOAT` kernel is used. Integer inputs must be cast
+explicitly. Leaf values retain their common DuckDB logical type without conversion.
 
 ## Building and testing
 
