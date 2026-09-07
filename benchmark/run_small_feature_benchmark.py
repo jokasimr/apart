@@ -43,16 +43,23 @@ def make_tree(depth, dimensions, seed):
     return coefficients, thresholds, left_children, right_children
 
 
-def tree_literal(tree, reference=0):
+def tree_literal(tree):
     coefficients, thresholds, left_children, right_children = tree
-    if reference < 0:
-        return f"{{value:{-reference - 1}}}"
-    weights = list_literal(float_literal(value) for value in coefficients[reference])
-    below = tree_literal(tree, left_children[reference])
-    above = tree_literal(tree, right_children[reference])
+    weight_rows = list_literal(
+        list_literal(float_literal(value) for value in row) for row in coefficients
+    )
+    threshold_values = list_literal(float_literal(value) for value in thresholds)
+    child_rows = list_literal(
+        f"[{above},{below}]" for above, below in zip(right_children, left_children)
+    )
+    leaf_count = max(
+        -reference
+        for reference in (*left_children, *right_children)
+        if reference < 0
+    )
     return (
-        f"{{weights:{weights},threshold:{float_literal(thresholds[reference])},"
-        f"below:{below},above:{above}}}"
+        f"{{weights:{weight_rows},thresholds:{threshold_values},children:{child_rows},"
+        f"values:{list_literal(range(leaf_count))}}}"
     )
 
 
@@ -93,22 +100,26 @@ def build_sql(rows, correctness_rows, warmups, runs, seed):
         "PRAGMA preserve_insertion_order=false;",
         feature_table_sql(rows),
     ]
+    cases = []
     for depth in DEPTHS:
         for dimensions in DIMENSIONS:
             tree = make_tree(depth, dimensions, seed)
             features = ", ".join(f"x{feature}" for feature in range(dimensions))
             name = f"n{dimensions}_d{depth}"
+            cases.append((tree, features, name))
             lines.append(f"CREATE MACRO tree_{name}() AS {tree_literal(tree)};")
-            lines.append(
-                f"PREPARE {name} AS SELECT '{name}', "
-                f"sum(decision_tree(tree_{name}(), {features}))::HUGEINT FROM features;"
-            )
-            lines.append(
-                f"SELECT 'verify_{name}', count(*) FROM "
-                f"(SELECT * FROM features LIMIT {correctness_rows}) sample "
-                f"WHERE decision_tree(tree_{name}(), {features}) "
-                f"IS DISTINCT FROM {reference_expression(tree)};"
-            )
+
+    for tree, features, name in cases:
+        lines.append(
+            f"PREPARE {name} AS SELECT '{name}', "
+            f"sum(decision_tree(tree_{name}(), {features}))::HUGEINT FROM features;"
+        )
+        lines.append(
+            f"SELECT 'verify_{name}', count(*) FROM "
+            f"(SELECT * FROM features LIMIT {correctness_rows}) sample "
+            f"WHERE decision_tree(tree_{name}(), {features}) "
+            f"IS DISTINCT FROM {reference_expression(tree)};"
+        )
 
     executions = []
     ordering = random.Random(seed)

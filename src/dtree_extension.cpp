@@ -39,20 +39,24 @@ struct ParsedTree {
 	vector<int64_t> left_children;
 	vector<int64_t> right_children;
 	vector<Value> leaf_values;
-	vector<string> node_paths;
 	LogicalType parameter_type;
 	LogicalType leaf_type;
-	int64_t root;
 };
 
 struct CompiledTree {
 	CompiledTree(const ParsedTree &tree, idx_t dimensions_p)
 	    : leaf_values(tree.leaf_type, tree.leaf_values.size() + 1), leaf_count(tree.leaf_values.size()), root(0),
-	      dimensions(dimensions_p), depth(0) {
+	      dimensions(dimensions_p), depth(0), leaf_values_all_valid(false) {
 		for (idx_t leaf_idx = 0; leaf_idx < leaf_count; leaf_idx++) {
 			leaf_values.SetValue(leaf_idx, tree.leaf_values[leaf_idx]);
 		}
 		leaf_values.SetValue(leaf_count, Value(tree.leaf_type));
+		leaf_values_all_valid = FlatVector::Validity(leaf_values).CheckAllValid(leaf_count);
+		if (tree.leaf_type.id() == LogicalTypeId::STRUCT) {
+			for (auto &child : StructVector::GetEntries(leaf_values)) {
+				struct_children_all_valid.push_back(FlatVector::Validity(*child).CheckAllValid(leaf_count));
+			}
+		}
 	}
 
 	virtual ~CompiledTree() {
@@ -63,6 +67,8 @@ struct CompiledTree {
 	uint32_t root;
 	idx_t dimensions;
 	uint32_t depth;
+	bool leaf_values_all_valid;
+	vector<bool> struct_children_all_valid;
 };
 
 template <class T, idx_t N>
@@ -187,111 +193,116 @@ static void IncludeParameterType(LogicalType &current, const LogicalType &type, 
 	IncludeCommonType(current, type, path);
 }
 
-class TreeParser {
-public:
-	explicit TreeParser(const Value &tree_value) {
-		result.parameter_type = LogicalType::SQLNULL;
-		result.leaf_type = LogicalType::SQLNULL;
-		result.root = ParseSubtree(tree_value, "tree");
-		if (result.leaf_type.id() == LogicalTypeId::SQLNULL || result.leaf_type.id() == LogicalTypeId::UNKNOWN) {
-			throw BinderException(
-			    "decision_tree leaf values must have a concrete type; cast at least one NULL value to "
-			    "the desired result type");
-		}
-		for (idx_t leaf = 0; leaf < result.leaf_values.size(); leaf++) {
-			try {
-				result.leaf_values[leaf] = result.leaf_values[leaf].DefaultCastAs(result.leaf_type);
-			} catch (Exception &ex) {
-				throw BinderException("decision_tree %s cannot be converted to the common leaf type %s: %s",
-				                      leaf_paths[leaf], result.leaf_type.ToString(), ex.what());
-			}
-		}
+static int64_t ReadChildReference(const Value &value, const string &path) {
+	if (value.IsNull()) {
+		throw BinderException("decision_tree %s cannot be NULL", path);
+	}
+	switch (value.type().id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+		break;
+	default:
+		throw BinderException("decision_tree %s must be a signed integer, not %s", path, value.type().ToString());
+	}
+	try {
+		return value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+	} catch (Exception &ex) {
+		throw BinderException("decision_tree %s is outside the supported BIGINT range: %s", path, ex.what());
+	}
+}
+
+static ParsedTree ParseTreeValue(const Value &tree_value) {
+	if (tree_value.IsNull()) {
+		throw BinderException("decision_tree tree cannot be NULL");
+	}
+	if (tree_value.type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException("decision_tree tree must be a STRUCT, not %s", tree_value.type().ToString());
 	}
 
-	ParsedTree TakeResult() {
-		return std::move(result);
+	auto &fields = StructType::GetChildTypes(tree_value.type());
+	auto weights_idx = RequireStructField(fields, "weights", "tree");
+	auto thresholds_idx = RequireStructField(fields, "thresholds", "tree");
+	auto children_idx = RequireStructField(fields, "children", "tree");
+	auto values_idx = RequireStructField(fields, "values", "tree");
+	if (fields.size() != 4) {
+		throw BinderException(
+		    "decision_tree tree must contain exactly 'weights', 'thresholds', 'children', and 'values'");
 	}
 
-private:
-	int64_t ParseSubtree(const Value &subtree, const string &path) {
-		if (subtree.IsNull()) {
-			throw BinderException("decision_tree %s must be a node or leaf, not NULL", path);
-		}
-		if (subtree.type().id() != LogicalTypeId::STRUCT) {
-			throw BinderException("decision_tree %s must be a node or leaf STRUCT, not %s", path,
-			                      subtree.type().ToString());
-		}
+	auto &fields_values = StructValue::GetChildren(tree_value);
+	auto &weight_rows = SequenceValues(fields_values[weights_idx], "tree.weights");
+	auto &threshold_values = SequenceValues(fields_values[thresholds_idx], "tree.thresholds");
+	auto &child_rows = SequenceValues(fields_values[children_idx], "tree.children");
+	auto &leaf_values = SequenceValues(fields_values[values_idx], "tree.values");
+	if (weight_rows.empty()) {
+		throw BinderException("decision_tree tree.weights must contain node 0");
+	}
+	if (weight_rows.size() >= LEAF_MASK) {
+		throw BinderException("decision_tree supports fewer than %u internal nodes", LEAF_MASK);
+	}
+	if (threshold_values.size() != weight_rows.size()) {
+		throw BinderException("decision_tree tree.thresholds has %llu values, but tree.weights has %llu nodes",
+		                      threshold_values.size(), weight_rows.size());
+	}
+	if (child_rows.size() != weight_rows.size()) {
+		throw BinderException("decision_tree tree.children has %llu entries, but tree.weights has %llu nodes",
+		                      child_rows.size(), weight_rows.size());
+	}
+	if (leaf_values.empty()) {
+		throw BinderException("decision_tree tree.values must contain at least one leaf value");
+	}
+	if (leaf_values.size() >= LEAF_MASK) {
+		throw BinderException("decision_tree supports fewer than %u leaves", LEAF_MASK);
+	}
 
-		auto &fields = StructType::GetChildTypes(subtree.type());
-		auto &values = StructValue::GetChildren(subtree);
-		auto value_idx = FindStructField(fields, "value");
-		if (value_idx.IsValid()) {
-			if (fields.size() != 1) {
-				throw BinderException("decision_tree leaf %s must contain only the field 'value'", path);
-			}
-			return AddLeaf(values[value_idx.GetIndex()], path + ".value");
-		}
+	ParsedTree result;
+	result.parameter_type = LogicalType::SQLNULL;
+	result.leaf_type = leaf_values[0].type();
+	if (result.leaf_type.id() == LogicalTypeId::SQLNULL || result.leaf_type.id() == LogicalTypeId::UNKNOWN) {
+		throw BinderException(
+		    "decision_tree leaf values must have a concrete type; cast NULL values to the desired result type");
+	}
+	result.coefficients.reserve(weight_rows.size());
+	result.thresholds.reserve(weight_rows.size());
+	result.left_children.reserve(weight_rows.size());
+	result.right_children.reserve(weight_rows.size());
+	result.leaf_values.assign(leaf_values.begin(), leaf_values.end());
 
-		auto weights_idx = RequireStructField(fields, "weights", path);
-		auto threshold_idx = RequireStructField(fields, "threshold", path);
-		auto below_idx = RequireStructField(fields, "below", path);
-		auto above_idx = RequireStructField(fields, "above", path);
-		if (fields.size() != 4) {
-			throw BinderException(
-			    "decision_tree node %s must contain exactly 'weights', 'threshold', 'below', and 'above'", path);
-		}
-		if (result.coefficients.size() >= LEAF_MASK) {
-			throw BinderException("decision_tree supports fewer than %u internal nodes", LEAF_MASK);
-		}
-
-		auto &weight_values = SequenceValues(values[weights_idx], path + ".weights");
+	for (idx_t node = 0; node < weight_rows.size(); node++) {
+		auto node_path = "tree.weights[" + to_string(node + 1) + "]";
+		auto &weight_values = SequenceValues(weight_rows[node], node_path);
 		vector<Value> weights;
 		weights.reserve(weight_values.size());
 		for (idx_t weight = 0; weight < weight_values.size(); weight++) {
-			auto weight_path = path + ".weights[" + to_string(weight + 1) + "]";
+			auto weight_path = node_path + "[" + to_string(weight + 1) + "]";
 			if (weight_values[weight].IsNull()) {
 				throw BinderException("decision_tree %s cannot be NULL", weight_path);
 			}
 			IncludeParameterType(result.parameter_type, weight_values[weight].type(), weight_path);
 			weights.push_back(weight_values[weight]);
 		}
-
-		auto &threshold = values[threshold_idx];
-		if (threshold.IsNull()) {
-			throw BinderException("decision_tree %s.threshold cannot be NULL", path);
-		}
-		IncludeParameterType(result.parameter_type, threshold.type(), path + ".threshold");
-
-		auto node = result.coefficients.size();
 		result.coefficients.push_back(std::move(weights));
-		result.thresholds.push_back(threshold);
-		result.left_children.push_back(0);
-		result.right_children.push_back(0);
-		result.node_paths.push_back(path);
-		auto below = ParseSubtree(values[below_idx], path + ".below");
-		auto above = ParseSubtree(values[above_idx], path + ".above");
-		result.left_children[node] = below;
-		result.right_children[node] = above;
-		return UnsafeNumericCast<int64_t>(node);
-	}
 
-	int64_t AddLeaf(const Value &value, const string &path) {
-		if (result.leaf_values.size() >= LEAF_MASK) {
-			throw BinderException("decision_tree supports fewer than %u leaves", LEAF_MASK);
+		auto threshold_path = "tree.thresholds[" + to_string(node + 1) + "]";
+		auto &threshold = threshold_values[node];
+		if (threshold.IsNull()) {
+			throw BinderException("decision_tree %s cannot be NULL", threshold_path);
 		}
-		IncludeCommonType(result.leaf_type, value.type(), path);
-		auto leaf = result.leaf_values.size();
-		result.leaf_values.push_back(value);
-		leaf_paths.push_back(path);
-		return -UnsafeNumericCast<int64_t>(leaf) - 1;
+		IncludeParameterType(result.parameter_type, threshold.type(), threshold_path);
+		result.thresholds.push_back(threshold);
+
+		auto child_path = "tree.children[" + to_string(node + 1) + "]";
+		auto &children = SequenceValues(child_rows[node], child_path);
+		if (children.size() != 2) {
+			throw BinderException("decision_tree %s must contain exactly [above, below]", child_path);
+		}
+		result.right_children.push_back(ReadChildReference(children[0], child_path + "[1]"));
+		result.left_children.push_back(ReadChildReference(children[1], child_path + "[2]"));
 	}
-
-	ParsedTree result;
-	vector<string> leaf_paths;
-};
-
-static ParsedTree ParseTreeValue(const Value &tree_value) {
-	return TreeParser(tree_value).TakeResult();
+	return result;
 }
 
 static void ValidateDimensions(const ParsedTree &tree, idx_t dimensions) {
@@ -300,8 +311,9 @@ static void ValidateDimensions(const ParsedTree &tree, idx_t dimensions) {
 	}
 	for (idx_t node_idx = 0; node_idx < tree.coefficients.size(); node_idx++) {
 		if (tree.coefficients[node_idx].size() != dimensions) {
-			throw BinderException("decision_tree %s.weights has %llu values, but the invocation has %llu features",
-			                      tree.node_paths[node_idx], tree.coefficients[node_idx].size(), dimensions);
+			throw BinderException(
+			    "decision_tree tree.weights[%llu] has %llu values, but the invocation has %llu features", node_idx + 1,
+			    tree.coefficients[node_idx].size(), dimensions);
 		}
 	}
 }
@@ -372,7 +384,7 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 		return target;
 	};
 
-	result.root = visit(tree.root, 0);
+	result.root = visit(0, 0);
 	for (idx_t node_idx = 0; node_idx < node_count; node_idx++) {
 		if (node_state[node_idx] == 0) {
 			throw BinderException("decision_tree contains unreachable internal node %llu", node_idx);
@@ -420,11 +432,11 @@ static shared_ptr<CompiledTree> CompileFixedTree(const ParsedTree &tree) {
 	auto result = make_shared_ptr<FixedTree<T, N>>(tree);
 	CompileTopology(tree, *result, [&](FixedTree<T, N> &target_tree, uint32_t target, idx_t source) {
 		auto &node = target_tree.nodes[target];
-		node.threshold = ReadNumber<T>(tree.thresholds[source], tree.node_paths[source] + ".threshold");
+		node.threshold = ReadNumber<T>(tree.thresholds[source], "tree.thresholds[" + to_string(source + 1) + "]");
 		for (idx_t feature_idx = 0; feature_idx < N; feature_idx++) {
 			node.coefficients[feature_idx] =
 			    ReadNumber<T>(tree.coefficients[source][feature_idx],
-			                  tree.node_paths[source] + ".weights[" + to_string(feature_idx + 1) + "]");
+			                  "tree.weights[" + to_string(source + 1) + "][" + to_string(feature_idx + 1) + "]");
 		}
 	});
 	if (result->depth != VARIABLE_DEPTH) {
@@ -440,11 +452,11 @@ static shared_ptr<CompiledTree> CompileGenericTree(const ParsedTree &tree, idx_t
 	result->coefficients.resize(node_count * dimensions);
 	CompileTopology(tree, *result, [&](GenericTree<T> &target_tree, uint32_t target, idx_t source) {
 		auto &node = target_tree.nodes[target];
-		node.threshold = ReadNumber<T>(tree.thresholds[source], tree.node_paths[source] + ".threshold");
+		node.threshold = ReadNumber<T>(tree.thresholds[source], "tree.thresholds[" + to_string(source + 1) + "]");
 		for (idx_t feature_idx = 0; feature_idx < dimensions; feature_idx++) {
 			target_tree.coefficients[feature_idx * node_count + target] =
 			    ReadNumber<T>(tree.coefficients[source][feature_idx],
-			                  tree.node_paths[source] + ".weights[" + to_string(feature_idx + 1) + "]");
+			                  "tree.weights[" + to_string(source + 1) + "][" + to_string(feature_idx + 1) + "]");
 		}
 	});
 	return result;
@@ -742,44 +754,142 @@ static const CompiledTree &GetTree(ExpressionState &state) {
 	return *expression.bind_info->Cast<DecisionTreeBindData>().tree;
 }
 
-static void EmitLeaves(const CompiledTree &tree, const SelectionVector &leaf_indices, idx_t count, bool all_constant,
+static bool IsSimpleLeafType(const LogicalType &type) {
+	return TypeIsConstantSize(type.InternalType());
+}
+
+static bool UseDictionary(const CompiledTree &tree, const LogicalType &type) {
+	return tree.leaf_count < STANDARD_VECTOR_SIZE / 2 && !IsSimpleLeafType(type);
+}
+
+static void CopyValidity(const Vector &source, Vector &target, const SelectionVector &selection, idx_t count,
+                         bool values_all_valid, bool selected_null) {
+	if (values_all_valid && !selected_null) {
+		return;
+	}
+	FlatVector::Validity(target).CopySel(FlatVector::Validity(source), selection, 0, 0, count);
+}
+
+template <class T>
+static void CopySimpleValues(const Vector &source, Vector &target, const SelectionVector &selection, idx_t count,
+                             bool values_all_valid, bool selected_null) {
+	auto source_data = FlatVector::GetData<T>(source);
+	auto target_data = FlatVector::GetData<T>(target);
+	for (idx_t row = 0; row < count; row++) {
+		target_data[row] = source_data[selection.get_index(row)];
+	}
+	CopyValidity(source, target, selection, count, values_all_valid, selected_null);
+}
+
+static void CopySimpleValues(const Vector &source, Vector &target, const SelectionVector &selection, idx_t count,
+                             bool values_all_valid, bool selected_null) {
+	switch (source.GetType().InternalType()) {
+	case PhysicalType::BOOL:
+	case PhysicalType::INT8:
+		return CopySimpleValues<int8_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::INT16:
+		return CopySimpleValues<int16_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::INT32:
+		return CopySimpleValues<int32_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::INT64:
+		return CopySimpleValues<int64_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::INT128:
+		return CopySimpleValues<hugeint_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::UINT8:
+		return CopySimpleValues<uint8_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::UINT16:
+		return CopySimpleValues<uint16_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::UINT32:
+		return CopySimpleValues<uint32_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::UINT64:
+		return CopySimpleValues<uint64_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::UINT128:
+		return CopySimpleValues<uhugeint_t>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::FLOAT:
+		return CopySimpleValues<float>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::DOUBLE:
+		return CopySimpleValues<double>(source, target, selection, count, values_all_valid, selected_null);
+	case PhysicalType::INTERVAL:
+		return CopySimpleValues<interval_t>(source, target, selection, count, values_all_valid, selected_null);
+	default:
+		throw InternalException("Unsupported simple decision_tree leaf type");
+	}
+}
+
+static void EmitStruct(const CompiledTree &tree, const SelectionVector &leaf_indices, idx_t count, bool selected_null,
                        Vector &result) {
-	if (!all_constant && tree.leaf_count < STANDARD_VECTOR_SIZE / 2) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	CopyValidity(tree.leaf_values, result, leaf_indices, count, tree.leaf_values_all_valid, selected_null);
+	auto &source = StructVector::GetEntries(tree.leaf_values);
+	auto &target = StructVector::GetEntries(result);
+	for (idx_t field = 0; field < source.size(); field++) {
+		if (UseDictionary(tree, source[field]->GetType())) {
+			target[field]->Reference(*source[field]);
+			target[field]->Dictionary(tree.leaf_count + 1, leaf_indices, count);
+		} else if (IsSimpleLeafType(source[field]->GetType())) {
+			CopySimpleValues(*source[field], *target[field], leaf_indices, count, tree.struct_children_all_valid[field],
+			                 selected_null);
+		} else {
+			target[field]->SetVectorType(VectorType::FLAT_VECTOR);
+			VectorOperations::Copy(*source[field], *target[field], leaf_indices, tree.leaf_count + 1, 0, 0, count);
+		}
+	}
+}
+
+static void EmitLeaves(const CompiledTree &tree, const SelectionVector &leaf_indices, idx_t count, bool all_constant,
+                       bool selected_null, Vector &result) {
+	if (all_constant) {
+		result.SetVectorType(VectorType::FLAT_VECTOR);
+		VectorOperations::Copy(tree.leaf_values, result, leaf_indices, tree.leaf_count + 1, 0, 0, count);
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		return;
+	}
+	if (tree.leaf_values.GetType().id() == LogicalTypeId::STRUCT) {
+		EmitStruct(tree, leaf_indices, count, selected_null, result);
+		return;
+	}
+	if (UseDictionary(tree, tree.leaf_values.GetType())) {
 		result.Reference(tree.leaf_values);
 		result.Dictionary(tree.leaf_count + 1, leaf_indices, count);
 		return;
 	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	VectorOperations::Copy(tree.leaf_values, result, leaf_indices, tree.leaf_count + 1, 0, 0, count);
-	if (all_constant) {
-		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	if (IsSimpleLeafType(tree.leaf_values.GetType())) {
+		CopySimpleValues(tree.leaf_values, result, leaf_indices, count, tree.leaf_values_all_valid, selected_null);
+	} else {
+		VectorOperations::Copy(tree.leaf_values, result, leaf_indices, tree.leaf_count + 1, 0, 0, count);
 	}
 }
 
-static void ApplyColumnNulls(DataChunk &args, idx_t count, idx_t null_leaf, SelectionVector &leaf_indices) {
+static bool ApplyColumnNulls(DataChunk &args, idx_t count, idx_t null_leaf, SelectionVector &leaf_indices) {
+	bool found_null = false;
 	for (auto &input : args.data) {
 		auto &validity = FlatVector::Validity(input);
 		if (!validity.AllValid()) {
 			for (idx_t row = 0; row < count; row++) {
 				if (!validity.RowIsValid(row)) {
 					leaf_indices.set_index(row, null_leaf);
+					found_null = true;
 				}
 			}
 		}
 	}
+	return found_null;
 }
 
-static void ApplyArrayNulls(Vector &arrays, Vector &elements, idx_t dimensions, idx_t count, idx_t null_leaf,
+static bool ApplyArrayNulls(Vector &arrays, Vector &elements, idx_t dimensions, idx_t count, idx_t null_leaf,
                             SelectionVector &leaf_indices) {
 	auto &array_validity = FlatVector::Validity(arrays);
 	auto &element_validity = FlatVector::Validity(elements);
 	auto elements_all_valid = element_validity.AllValid();
 	if (array_validity.AllValid() && elements_all_valid) {
-		return;
+		return false;
 	}
+	bool found_null = false;
 	for (idx_t row = 0; row < count; row++) {
 		if (!array_validity.RowIsValid(row)) {
 			leaf_indices.set_index(row, null_leaf);
+			found_null = true;
 			continue;
 		}
 		if (!elements_all_valid) {
@@ -787,11 +897,13 @@ static void ApplyArrayNulls(Vector &arrays, Vector &elements, idx_t dimensions, 
 			for (idx_t feature = 0; feature < dimensions; feature++) {
 				if (!element_validity.RowIsValid(offset + feature)) {
 					leaf_indices.set_index(row, null_leaf);
+					found_null = true;
 					break;
 				}
 			}
 		}
 	}
+	return found_null;
 }
 
 template <class T, idx_t N>
@@ -811,8 +923,8 @@ static void ExecuteFixedColumns(DataChunk &args, ExpressionState &state, Vector 
 
 	ColumnInput<T> input {local_state.features.data()};
 	EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
-	ApplyColumnNulls(args, count, tree.leaf_count, local_state.leaf_indices);
-	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, result);
+	auto selected_null = ApplyColumnNulls(args, count, tree.leaf_count, local_state.leaf_indices);
+	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
 template <class T, idx_t N>
@@ -833,8 +945,8 @@ static void ExecuteFixedArray(DataChunk &args, ExpressionState &state, Vector &r
 
 	FixedArrayInput<T, N> input {FlatVector::GetData<T>(elements)};
 	EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
-	ApplyArrayNulls(arrays, elements, N, count, tree.leaf_count, local_state.leaf_indices);
-	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, result);
+	auto selected_null = ApplyArrayNulls(arrays, elements, N, count, tree.leaf_count, local_state.leaf_indices);
+	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
 template <class T>
@@ -854,8 +966,8 @@ static void ExecuteGenericColumns(DataChunk &args, ExpressionState &state, Vecto
 
 	ColumnInput<T> input {local_state.features.data()};
 	EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
-	ApplyColumnNulls(args, count, tree.leaf_count, local_state.leaf_indices);
-	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, result);
+	auto selected_null = ApplyColumnNulls(args, count, tree.leaf_count, local_state.leaf_indices);
+	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
 template <class T>
@@ -876,8 +988,9 @@ static void ExecuteGenericArray(DataChunk &args, ExpressionState &state, Vector 
 
 	GenericArrayInput<T> input {FlatVector::GetData<T>(elements), tree.dimensions};
 	EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
-	ApplyArrayNulls(arrays, elements, tree.dimensions, count, tree.leaf_count, local_state.leaf_indices);
-	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, result);
+	auto selected_null =
+	    ApplyArrayNulls(arrays, elements, tree.dimensions, count, tree.leaf_count, local_state.leaf_indices);
+	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
 template <class T>

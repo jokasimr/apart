@@ -7,51 +7,43 @@ decision_tree(tree, x1, x2, ..., xn) -> T
 decision_tree(tree, features_array)   -> T
 ```
 
-The tree is a constant, recursively nested DuckDB `STRUCT`. Features must be `FLOAT` or `DOUBLE`; weights and
-thresholds may use any numeric type and are converted to the computation type at bind time. `T` is the common type of
-the leaf values and may be any concrete DuckDB logical type. The second form requires a fixed-size array whose length
-supplies the dimensionality.
+The tree is a constant DuckDB `STRUCT`. Features must be `FLOAT` or `DOUBLE`; weights and thresholds may use any
+numeric type and are converted to the computation type at bind time. `T` is the type of the values list and may be any
+concrete DuckDB logical type. The second form requires a fixed-size array whose length supplies the dimensionality.
 
 ## Tree representation
 
-An internal node has four fields:
+The tree has four fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `weights` | numeric `LIST`/`ARRAY` | The affine weights, in feature-argument order. |
-| `threshold` | numeric value | The comparison threshold. |
-| `below` | node or leaf `STRUCT` | Subtree selected when the comparison is false. |
-| `above` | node or leaf `STRUCT` | Subtree selected when the score is at or above the threshold. |
+| `weights` | numeric nested `LIST`/`ARRAY` | One weight vector per internal node, in feature-argument order. |
+| `thresholds` | numeric `LIST`/`ARRAY` | One comparison threshold per internal node. |
+| `children` | signed-integer nested `LIST`/`ARRAY` | Two references per node, ordered `[above, below]`. |
+| `values` | `LIST`/`ARRAY` | The leaf values. |
 
-A leaf has exactly one field, `value`, containing the value to return. A whole tree may consist of a single leaf:
-
-```sql
-{value: 42}
-```
-
-For an internal node, evaluation computes:
+Node `i` evaluates:
 
 ```text
-score = sum(weights[j] * x[j])
+score = sum(weights[i][j] * x[j])
 ```
 
-It follows `above` when `score >= threshold` and `below` otherwise. Thus equality follows `above`; a `NaN` score
-follows `below`.
+With `children[i] = [above, below]`, it follows `above` when `score >= thresholds[i]` and `below` otherwise.
+Non-negative child references select another internal node. A negative reference `-k-1` returns `values[k]`. The root
+is always node `0`. Thus equality follows `above`; a `NaN` score follows `below`.
+
+`weights`, `thresholds`, and `children` must contain the same number of entries. Every internal node and leaf value
+must be reachable from node `0`; cycles and shared internal nodes are rejected.
 
 Example:
 
 ```sql
 SELECT decision_tree(
     {
-        weights: [1, 0],
-        threshold: 0,
-        below: {value: 10},
-        above: {
-            weights: [0, 1],
-            threshold: 10,
-            below: {value: 20},
-            above: {value: 30}
-        }
+        weights: [[1, 0], [0, 1]],
+        thresholds: [0, 10],
+        children: [[1, -1], [-3, -2]],
+        values: [10, 20, 30]
     },
     x,
     y
@@ -71,9 +63,9 @@ FROM feature_table;
 At bind time, `dtree`:
 
 - requires and evaluates the constant tree expression;
-- validates every node and leaf and checks each weight vector against the feature count;
-- determines a common leaf type and numeric computation type;
-- flattens the recursive authoring representation into indexed nodes and leaves;
+- validates the node and leaf arrays and checks each weight vector against the feature count;
+- determines the leaf type and numeric computation type;
+- validates and follows the indexed topology from root node `0`;
 - rewrites nodes into typed execution arrays;
 - records whether every leaf has the same depth;
 - selects a `FLOAT` or `DOUBLE` kernel specialized for feature counts one through five, or a runtime-size kernel for
@@ -88,19 +80,21 @@ have the same depth use a fixed-depth loop; other shapes track which rows have r
 itself is branchless. The separate-column and fixed-array interfaces share the same traversal implementations.
 
 Traversal writes leaf indices into one reusable selection buffer allocated by DuckDB's function-local initialization.
-After traversal, results with fewer than `STANDARD_VECTOR_SIZE / 2` authored leaves use that selection as a dictionary
-over the leaf vector; larger leaf sets are copied to a flat result. The decision uses the number of leaves, without
-comparing or deduplicating their values. This keeps arbitrary leaf types, including strings and nested values, entirely
-outside the numerical loop. The extension performs no allocation in traversal or per-chunk allocation for its scratch
-state. Flattening encoded inputs and constructing variable-sized flat outputs may use DuckDB-managed allocations
-outside traversal.
+After traversal, fixed-size scalar leaf values are copied to a flat result. Variable-size and nested values use
+dictionary encoding when there are fewer than `STANDARD_VECTOR_SIZE / 2` authored leaves; larger leaf sets are copied
+to a flat result. `STRUCT` results have a flat outer vector, with the same decision applied independently to each
+child. Fixed-size scalar children use direct typed indexed-copy loops, while other children follow the dictionary
+policy above. The dictionary decision uses the number of leaves without comparing or deduplicating their values. This
+keeps arbitrary leaf handling entirely outside the numerical loop. The extension performs no allocation in traversal
+or per-chunk allocation for its scratch state. Flattening encoded inputs and constructing variable-sized outputs may
+use DuckDB-managed allocations outside traversal.
 
 ### Numeric types
 
 Feature inputs must be `FLOAT` or `DOUBLE`. Weights and thresholds may use ordinary integer, decimal, `FLOAT`, or
 `DOUBLE` literals. DuckDB's numeric promotion rules combine them with the feature type; the resulting computation uses
-the `FLOAT` or `DOUBLE` kernel. Integer feature inputs must still be cast explicitly. Leaf values are converted at bind
-time to their common DuckDB logical type.
+the `FLOAT` or `DOUBLE` kernel. Integer feature inputs must still be cast explicitly. DuckDB assigns one common logical
+type to the elements of `values`; that becomes the function's result type.
 
 ## Building and testing
 

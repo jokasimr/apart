@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from run_benchmarks import TIMER_PATTERN, float_literal
+from run_benchmarks import TIMER_PATTERN, float_literal, list_literal
 
 
 LEAF_COUNTS = (1023, 1024, 1025)
@@ -27,52 +27,58 @@ class Execution:
 def leaf_literal(payload, leaf_index):
     value = float_literal(float(leaf_index))
     if payload == "float":
-        return f"{{value:{value}}}"
+        return value
     return (
-        "{value:{items:["
+        "{items:["
         f"{value},{float_literal(leaf_index + 0.25)},{float_literal(leaf_index * 0.5)}"
-        "]}}"
+        "]}"
     )
 
 
 def tree_literal(payload, leaf_count):
-    next_leaf = 0
+    weights = []
+    thresholds = []
+    children = []
+    values = []
 
     def make_leaf():
-        nonlocal next_leaf
-        result = leaf_literal(payload, next_leaf)
-        next_leaf += 1
-        return result
+        leaf = len(values)
+        values.append(leaf_literal(payload, leaf))
+        return -leaf - 1
 
     def make_node(depth, position):
         # Collapse the two leftmost depth-10 leaves into one leaf.
         if leaf_count == 1023 and depth == BASE_DEPTH - 1 and position == 0:
             return make_leaf()
 
+        if depth == BASE_DEPTH and not (leaf_count == 1025 and position == 0):
+            return make_leaf()
+
+        node = len(weights)
+        weights.append("[1::FLOAT,0::FLOAT,0::FLOAT]")
+        thresholds.append(None)
+        children.append(None)
         if depth == BASE_DEPTH:
             # Split the leftmost depth-10 leaf into two depth-11 leaves.
-            if leaf_count == 1025 and position == 0:
-                below = make_leaf()
-                above = make_leaf()
-                threshold = float_literal(1.0 / (1 << (BASE_DEPTH + 1)))
-                return (
-                    f"{{weights:[1::FLOAT,0::FLOAT,0::FLOAT],threshold:{threshold},"
-                    f"below:{below},above:{above}}}"
-                )
-            return make_leaf()
+            below = make_leaf()
+            above = make_leaf()
+            thresholds[node] = float_literal(1.0 / (1 << (BASE_DEPTH + 1)))
+            children[node] = f"[{above},{below}]"
+            return node
 
         below = make_node(depth + 1, position * 2)
         above = make_node(depth + 1, position * 2 + 1)
-        threshold = float_literal((2 * position + 1) / (1 << (depth + 1)))
-        return (
-            f"{{weights:[1::FLOAT,0::FLOAT,0::FLOAT],threshold:{threshold},"
-            f"below:{below},above:{above}}}"
-        )
+        thresholds[node] = float_literal((2 * position + 1) / (1 << (depth + 1)))
+        children[node] = f"[{above},{below}]"
+        return node
 
-    result = make_node(0, 0)
-    if next_leaf != leaf_count:
-        raise AssertionError(f"constructed {next_leaf} leaves instead of {leaf_count}")
-    return result
+    root = make_node(0, 0)
+    if root != 0 or len(values) != leaf_count:
+        raise AssertionError(f"constructed root {root} with {len(values)} leaves")
+    return (
+        f"{{weights:{list_literal(weights)},thresholds:{list_literal(thresholds)},"
+        f"children:{list_literal(children)},values:{list_literal(values)}}}"
+    )
 
 
 def expected_leaf_expression(leaf_count):
@@ -145,6 +151,7 @@ def build_sql(rows, correctness_rows, warmups, runs, seed):
         name = f"{payload}_{leaf_count}"
         tree_name = f"tree_{name}"
         actual = f"decision_tree({tree_name}(), x0, x1, x2)"
+        encoded = actual if payload == "float" else f"({actual}).items"
         expected = expected_value_expression(payload, leaf_count)
         lines.append(
             f"SELECT 'verify_{name}', count(*) FROM "
@@ -153,7 +160,7 @@ def build_sql(rows, correctness_rows, warmups, runs, seed):
         )
         lines.append(
             f"SELECT 'encoding_{name}', min(kind), max(kind), count(DISTINCT kind) "
-            f"FROM (SELECT vector_type({actual}) AS kind FROM features LIMIT 4096);"
+            f"FROM (SELECT vector_type({encoded}) AS kind FROM features LIMIT 4096);"
         )
         lines.append(
             f"PREPARE {name} AS SELECT '{name}', "
@@ -235,15 +242,15 @@ def main():
         raise RuntimeError(f"correctness check failed: {verifications}")
     expected_encodings = {}
     for payload in PAYLOADS:
-        expected_encodings[f"{payload}_1023"] = (
-            "DICTIONARY_VECTOR",
-            "DICTIONARY_VECTOR",
-            1,
-        )
-        for leaf_count in (1024, 1025):
+        for leaf_count in LEAF_COUNTS:
+            vector_type = (
+                "DICTIONARY_VECTOR"
+                if payload == "struct" and leaf_count == 1023
+                else "FLAT_VECTOR"
+            )
             expected_encodings[f"{payload}_{leaf_count}"] = (
-                "FLAT_VECTOR",
-                "FLAT_VECTOR",
+                vector_type,
+                vector_type,
                 1,
             )
     if encodings != expected_encodings:
@@ -272,7 +279,11 @@ def main():
             center = statistics.median(values)
             medians[(payload, leaf_count)] = center
             dispersion = median_absolute_deviation(values)
-            encoding = "dictionary" if leaf_count == 1023 else "flat"
+            encoding = (
+                "dictionary"
+                if payload == "struct" and leaf_count == 1023
+                else "flat"
+            )
             print(
                 f"| {payload} | {leaf_count} | {encoding} | {center * 1e3:.2f} | "
                 f"{dispersion * 1e3:.2f} | {center * 1e9 / args.rows:.2f} |"
@@ -281,11 +292,10 @@ def main():
     print()
     print("| Leaf type | Flat - dictionary (ns/row) | Flat / dictionary |")
     print("|:--|--:|--:|")
-    for payload in PAYLOADS:
-        dictionary = medians[(payload, 1023)]
-        flat = medians[(payload, 1025)]
-        delta = (flat - dictionary) * 1e9 / args.rows
-        print(f"| {payload} | {delta:+.2f} | {flat / dictionary:.3f}x |")
+    dictionary = medians[("struct", 1023)]
+    flat = medians[("struct", 1025)]
+    delta = (flat - dictionary) * 1e9 / args.rows
+    print(f"| struct | {delta:+.2f} | {flat / dictionary:.3f}x |")
 
 
 if __name__ == "__main__":

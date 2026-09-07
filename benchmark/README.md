@@ -38,9 +38,9 @@ and 9:
 python3 benchmark/run_small_feature_benchmark.py --duckdb build/release/duckdb
 ```
 
-The output-encoding benchmark compares the dictionary and flat output paths immediately below and above the leaf-count
-threshold. It uses near-identical variable-depth trees with 1,023 and 1,025 leaves, plus a 1,024-leaf equal-depth
-control. It measures both `FLOAT` leaves and `STRUCT` leaves containing a three-element `FLOAT` list:
+The output-encoding benchmark checks flat primitive output and compares dictionary and flat output for an expensive
+child immediately below and above the leaf-count threshold. It uses near-identical variable-depth trees with 1,023 and
+1,025 leaves, plus a 1,024-leaf equal-depth control. It measures `FLOAT` leaves and the list child of `STRUCT` leaves:
 
 ```sh
 python3 benchmark/run_output_encoding_benchmark.py --duckdb build/release/duckdb
