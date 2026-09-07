@@ -1,111 +1,85 @@
-# Dtree
+# dtree
 
-`dtree` is a DuckDB extension that evaluates affine binary decision trees with a variadic scalar function:
+`dtree` is a DuckDB extension for evaluating affine binary decision trees directly in SQL. It is intended for applying a fixed tree efficiently to many rows while keeping both the data and the computation inside DuckDB.
+
+## Usage
+
+The extension provides two forms of the `decision_tree` scalar function:
 
 ```sql
 decision_tree(tree, x1, x2, ..., xn) -> T
-decision_tree(tree, features_array)   -> T
+decision_tree(tree, features)         -> T
 ```
 
-The tree is a constant DuckDB `STRUCT`. Features must be `FLOAT` or `DOUBLE`; weights and thresholds may use any
-numeric type and are converted to the computation type at bind time. `T` is the type of the values list and may be any
-concrete DuckDB logical type. The second form requires a fixed-size array whose length supplies the dimensionality.
+The first form accepts one or more feature arguments. The second accepts a fixed-size DuckDB `ARRAY`. Feature values must be `FLOAT` or `DOUBLE`.
 
-## Tree representation
+The tree must be constant for the query. Its leaf values must have one common type, which becomes the return type `T`. Leaf values may use any DuckDB type, including `STRUCT`, `LIST`, and `ARRAY`.
 
-The tree has four fields:
+## Tree format
 
-| Field | Type | Meaning |
+A tree is a `STRUCT` with four fields:
+
+| Field | Type | Contents |
 |---|---|---|
-| `weights` | numeric nested `LIST`/`ARRAY` | One weight vector per internal node, in feature-argument order. |
-| `thresholds` | numeric `LIST`/`ARRAY` | One comparison threshold per internal node. |
-| `children` | signed-integer nested `LIST`/`ARRAY` | Two references per node, ordered `[above, below]`. |
-| `values` | `LIST`/`ARRAY` | The leaf values. |
+| `weights` | nested `LIST` or `ARRAY` | One numeric weight vector per internal node, in feature-argument order. |
+| `thresholds` | `LIST` or `ARRAY` | One numeric threshold per internal node. |
+| `children` | nested `LIST` or `ARRAY` | Two signed integer references per internal node, ordered `[above, below]`. |
+| `values` | `LIST` or `ARRAY` | The values returned by the leaves. |
 
 Node `i` evaluates:
 
 ```text
-score = sum(weights[i][j] * x[j])
+sum(weights[i][j] * x[j]) >= thresholds[i]
 ```
 
-With `children[i] = [above, below]`, it follows `above` when `score >= thresholds[i]` and `below` otherwise.
-Non-negative child references select another internal node. A negative reference `-k-1` returns `values[k]`. The root
-is always node `0`. Thus equality follows `above`; a `NaN` score follows `below`.
+If the condition is true, evaluation follows the first child reference (`above`). Otherwise, it follows the second (`below`). Equality therefore follows `above`.
 
-`weights`, `thresholds`, and `children` must contain the same number of entries. Every internal node and leaf value
-must be reachable from node `0`; cycles and shared internal nodes are rejected.
+Child references use this encoding:
 
-Example:
+```text
+ 0  -> node 0
+ 1  -> node 1
+-1  -> values[0]
+-2  -> values[1]
+-3  -> values[2]
+```
+
+The root is always node `0`. `weights`, `thresholds`, and `children` must have the same length, and every weight vector must have one entry per feature. Weights, thresholds, and child references cannot be `NULL`; leaf values may be. All nodes and leaf values must be reachable from the root. Cycles and shared internal nodes are not allowed.
+
+## Example
+
+This tree returns `negative` when `x < 0`. Otherwise, it returns `low` when `y < 10` and `high` when `y >= 10`.
 
 ```sql
-SELECT decision_tree(
-    {
-        weights: [[1, 0], [0, 1]],
-        thresholds: [0, 10],
-        children: [[1, -1], [-3, -2]],
-        values: [10, 20, 30]
-    },
-    x,
-    y
-)
-FROM feature_table;
+LOAD dtree;
+
+CREATE MACRO example_tree() AS {
+    weights: [
+        [1.0, 0.0],
+        [0.0, 1.0]
+    ],
+    thresholds: [0.0, 10.0],
+    children: [
+        [1, -1],
+        [-3, -2]
+    ],
+    values: ['negative', 'low', 'high']
+};
+
+SELECT decision_tree(example_tree(), x, y) AS result
+FROM measurements;
 ```
 
-The equivalent fixed-array call is:
+The equivalent array form is:
 
 ```sql
-SELECT decision_tree(tree_struct, [x, y]::FLOAT[2])
-FROM feature_table;
+SELECT decision_tree(example_tree(), [x, y]::FLOAT[2]) AS result
+FROM measurements;
 ```
 
-## Binding and execution
-
-At bind time, `dtree`:
-
-- requires and evaluates the constant tree expression;
-- validates the node and leaf arrays and checks each weight vector against the feature count;
-- determines the leaf type and numeric computation type;
-- validates and follows the indexed topology from root node `0`;
-- rewrites nodes into typed execution arrays;
-- records whether every leaf has the same depth;
-- selects a `FLOAT` or `DOUBLE` kernel specialized for feature counts one through five, or a runtime-size kernel for
-  larger counts;
-- removes the constant tree argument from runtime execution.
-
-For fixed feature counts, equal-depth trees are stored in heap order with only coefficients and thresholds; the kernel
-computes each child index directly. Other fixed-size trees retain explicit child references in depth-first order. The
-general evaluator stores coefficients feature-major and loops over the runtime dimension. All kernels advance eight
-independent rows together so the processor can overlap their otherwise dependent traversals. Trees whose leaves all
-have the same depth use a fixed-depth loop; other shapes track which rows have reached a leaf. The below/above choice
-itself is branchless. The separate-column and fixed-array interfaces share the same traversal implementations.
-
-Traversal writes leaf indices into one reusable selection buffer allocated by DuckDB's function-local initialization.
-After traversal, fixed-size scalar leaf values are copied to a flat result. Variable-size and nested values use
-dictionary encoding when there are fewer than `STANDARD_VECTOR_SIZE / 2` authored leaves; larger leaf sets are copied
-to a flat result. `STRUCT` results have a flat outer vector, with the same decision applied independently to each
-child. Fixed-size scalar children use direct typed indexed-copy loops, while other children follow the dictionary
-policy above. The dictionary decision uses the number of leaves without comparing or deduplicating their values. This
-keeps arbitrary leaf handling entirely outside the numerical loop. The extension performs no allocation in traversal
-or per-chunk allocation for its scratch state. Flattening encoded inputs and constructing variable-sized outputs may
-use DuckDB-managed allocations outside traversal.
-
-### Numeric types
-
-Feature inputs must be `FLOAT` or `DOUBLE`. Weights and thresholds may use ordinary integer, decimal, `FLOAT`, or
-`DOUBLE` literals. DuckDB's numeric promotion rules combine them with the feature type; the resulting computation uses
-the `FLOAT` or `DOUBLE` kernel. Integer feature inputs must still be cast explicitly. DuckDB assigns one common logical
-type to the elements of `values`; that becomes the function's result type.
+Weights and thresholds may use any numeric type and are converted to the feature computation type. Integer features must be cast to `FLOAT` or `DOUBLE`. If any feature is `NULL`, the result is `NULL`.
 
 ## Building and testing
-
-The repository is based on the official [DuckDB extension template](https://github.com/duckdb/extension-template).
-
-```sh
-make debug
-make test_debug
-```
-
-Release builds use:
 
 ```sh
 make
