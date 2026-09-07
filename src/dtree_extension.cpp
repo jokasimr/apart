@@ -207,11 +207,16 @@ static int64_t ReadChildReference(const Value &value, const string &path) {
 	default:
 		throw BinderException("decision_tree %s must be a signed integer, not %s", path, value.type().ToString());
 	}
+	int64_t reference;
 	try {
-		return value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		reference = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 	} catch (Exception &ex) {
 		throw BinderException("decision_tree %s is outside the supported BIGINT range: %s", path, ex.what());
 	}
+	if (reference == 0) {
+		throw BinderException("decision_tree %s cannot be 0", path);
+	}
+	return reference > 0 ? reference - 1 : reference;
 }
 
 static ParsedTree ParseTreeValue(const Value &tree_value) {
@@ -238,7 +243,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	auto &child_rows = SequenceValues(fields_values[children_idx], "tree.children");
 	auto &leaf_values = SequenceValues(fields_values[values_idx], "tree.values");
 	if (weight_rows.empty()) {
-		throw BinderException("decision_tree tree.weights must contain node 0");
+		throw BinderException("decision_tree tree.weights must contain root node 1");
 	}
 	if (weight_rows.size() >= LEAF_MASK) {
 		throw BinderException("decision_tree supports fewer than %u internal nodes", LEAF_MASK);
@@ -362,14 +367,14 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 		auto source = UnsafeNumericCast<uint64_t>(reference);
 		if (source >= node_count) {
 			throw BinderException("decision_tree internal-node reference %lld is out of range for %llu nodes",
-			                      reference, node_count);
+			                      reference + 1, node_count);
 		}
 		if (node_state[source] == 1) {
-			throw BinderException("decision_tree topology contains a cycle at internal node %lld", reference);
+			throw BinderException("decision_tree topology contains a cycle at internal node %lld", reference + 1);
 		}
 		if (node_state[source] == 2) {
 			throw BinderException("decision_tree topology reuses internal node %lld; topology must be a tree",
-			                      reference);
+			                      reference + 1);
 		}
 
 		node_state[source] = 1;
@@ -387,12 +392,12 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 	result.root = visit(0, 0);
 	for (idx_t node_idx = 0; node_idx < node_count; node_idx++) {
 		if (node_state[node_idx] == 0) {
-			throw BinderException("decision_tree contains unreachable internal node %llu", node_idx);
+			throw BinderException("decision_tree contains unreachable internal node %llu", node_idx + 1);
 		}
 	}
 	for (idx_t leaf_idx = 0; leaf_idx < leaf_count; leaf_idx++) {
 		if (!leaf_used[leaf_idx]) {
-			throw BinderException("decision_tree contains unreachable leaf value %llu", leaf_idx);
+			throw BinderException("decision_tree contains unreachable leaf value %llu", leaf_idx + 1);
 		}
 	}
 }

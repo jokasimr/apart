@@ -57,6 +57,10 @@ def list_literal(values):
     return "[" + ",".join(str(value) for value in values) + "]"
 
 
+def public_reference(reference):
+    return reference + 1 if reference >= 0 else reference
+
+
 def make_tree(depth, seed):
     rng = SplitMix64(seed + depth)
     node_count = (1 << depth) - 1
@@ -93,7 +97,7 @@ def tree_literal(tree):
     )
     thresholds = list_literal(float_literal(value) for value in tree.thresholds)
     children = list_literal(
-        f"[{above},{below}]"
+        f"[{public_reference(above)},{public_reference(below)}]"
         for above, below in zip(tree.right_children, tree.left_children)
     )
     leaf_count = max(

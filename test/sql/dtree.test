@@ -19,7 +19,7 @@ SELECT decision_tree(
     {
         weights: [[1, 0], [0, 1]],
         thresholds: [0, 10],
-        children: [[1, -1], [-3, -2]],
+        children: [[2, -1], [-3, -2]],
         values: [10, 20, 30]
     },
     x,
@@ -46,7 +46,7 @@ SELECT decision_tree(
     {
         weights: [[1, 0], [0, 1]],
         thresholds: [0, 10],
-        children: [[1, -1], [-3, -2]],
+        children: [[2, -1], [-3, -2]],
         values: [10, 20, 30]
     },
     [x, y]::FLOAT[2]
@@ -63,7 +63,7 @@ statement ok
 CREATE MACRO generic_test_tree() AS {
     weights: [[1, 0, 0], [0, 1, 0]],
     thresholds: [0, 0],
-    children: [[1, -1], [-3, -2]],
+    children: [[2, -1], [-3, -2]],
     values: [10, 20, 30]
 };
 
@@ -161,7 +161,7 @@ CREATE MACRO repeated_leaf_tree(v) AS {
     weights: list_transform(range(1023), i -> [0]),
     thresholds: list_transform(range(1023), i -> 0),
     children: list_transform(range(1023), i -> CASE WHEN i < 511
-        THEN [2 * i + 2, 2 * i + 1]
+        THEN [2 * i + 3, 2 * i + 2]
         ELSE [-2 * (i - 511) - 2, -2 * (i - 511) - 1]
     END),
     values: list_transform(range(1024), i -> v)
@@ -194,7 +194,7 @@ statement ok
 CREATE MACRO fixed_depth_test_tree() AS {
     weights: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
     thresholds: [0, 0, 0],
-    children: [[2, 1], [-2, -1], [-4, -3]],
+    children: [[3, 2], [-2, -1], [-4, -3]],
     values: [10, 20, 30, 40]
 };
 
@@ -239,7 +239,7 @@ statement ok
 CREATE MACRO generic_six_tree() AS {
     weights: [[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]],
     thresholds: [0, 0],
-    children: [[1, -1], [-3, -2]],
+    children: [[2, -1], [-3, -2]],
     values: ['left', 'middle', 'right']
 };
 
@@ -354,7 +354,7 @@ SELECT decision_tree(
     {
         weights: [[1], [1]],
         thresholds: [0, 10],
-        children: [[1, -1], [-3, -2]],
+        children: [[2, -1], [-3, -2]],
         values: [10, 20, 30]
     },
     x
@@ -371,7 +371,7 @@ SELECT decision_tree(
     {
         weights: [[1, 0], [0, 1], [0, 1]],
         thresholds: [0, 0, 0],
-        children: [[2, 1], [-2, -1], [-4, -3]],
+        children: [[3, 2], [-2, -1], [-4, -3]],
         values: [10, 20, 20, 30]
     },
     x,
@@ -405,14 +405,14 @@ FROM (VALUES (-1.0::FLOAT), (1.0::FLOAT)) features(x);
 10	30
 20	40
 
-# Root node 0 must exist.
+# Root node 1 must exist.
 statement error
 SELECT decision_tree(
     {weights: []::INTEGER[][], thresholds: [], children: []::INTEGER[][], values: [42]},
     123.0::FLOAT
 );
 ----
-<REGEX>:.*weights must contain node 0.*
+<REGEX>:.*weights must contain root node 1.*
 
 # The tree must be constant and structurally valid.
 statement error
@@ -504,7 +504,7 @@ SELECT decision_tree(
     {
         weights: [[1], [1, 2]],
         thresholds: [0, 0],
-        children: [[1, -1], [-3, -2]],
+        children: [[2, -1], [-3, -2]],
         values: [0, 1, 2]
     },
     1.0::FLOAT
@@ -537,14 +537,22 @@ SELECT decision_tree(
 ----
 <REGEX>:.*children\[1\]\[1\].*signed integer.*
 
-# References must describe one connected, acyclic tree rooted at node 0.
 statement error
 SELECT decision_tree(
-    {weights: [[1]], thresholds: [0], children: [[1, -1]], values: [0]},
+    {weights: [[1]], thresholds: [0], children: [[0, -1]], values: [0]},
     1.0::FLOAT
 );
 ----
-<REGEX>:.*internal-node reference 1 is out of range.*
+<REGEX>:.*children\[1\]\[1\].*cannot be 0.*
+
+# References must describe one connected, acyclic tree rooted at node 1.
+statement error
+SELECT decision_tree(
+    {weights: [[1]], thresholds: [0], children: [[2, -1]], values: [0]},
+    1.0::FLOAT
+);
+----
+<REGEX>:.*internal-node reference 2 is out of range.*
 
 statement error
 SELECT decision_tree(
@@ -556,19 +564,19 @@ SELECT decision_tree(
 
 statement error
 SELECT decision_tree(
-    {weights: [[1]], thresholds: [0], children: [[0, -1]], values: [0]},
+    {weights: [[1]], thresholds: [0], children: [[1, -1]], values: [0]},
     1.0::FLOAT
 );
 ----
-<REGEX>:.*cycle.*node 0.*
+<REGEX>:.*cycle.*node 1.*
 
 statement error
 SELECT decision_tree(
-    {weights: [[1], [1]], thresholds: [0, 0], children: [[1, 1], [-2, -1]], values: [0, 1]},
+    {weights: [[1], [1]], thresholds: [0, 0], children: [[2, 2], [-2, -1]], values: [0, 1]},
     1.0::FLOAT
 );
 ----
-<REGEX>:.*reuses internal node 1.*
+<REGEX>:.*reuses internal node 2.*
 
 statement error
 SELECT decision_tree(
@@ -576,7 +584,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*unreachable internal node 1.*
+<REGEX>:.*unreachable internal node 2.*
 
 statement error
 SELECT decision_tree(
@@ -584,7 +592,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*unreachable leaf value 2.*
+<REGEX>:.*unreachable leaf value 3.*
 
 # Untyped NULL leaf values need an explicit result type.
 statement error

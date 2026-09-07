@@ -37,14 +37,16 @@ If the condition is true, evaluation follows the first child reference (`above`)
 Child references use this encoding:
 
 ```text
- 0  -> node 0
- 1  -> node 1
--1  -> values[0]
--2  -> values[1]
--3  -> values[2]
+ 1  -> first node
+ 2  -> second node
+-1  -> first leaf value
+-2  -> second leaf value
+-3  -> third leaf value
 ```
 
-The root is always node `0`. `weights`, `thresholds`, and `children` must have the same length, and every weight vector must have one entry per feature. Weights, thresholds, and child references cannot be `NULL`; leaf values may be. All nodes and leaf values must be reachable from the root. Cycles and shared internal nodes are not allowed.
+Positive references index `weights`, `thresholds`, and `children`; negative references index `values`. References are one-based, matching DuckDB list indexing, and `0` is invalid.
+
+The root is always node `1`. `weights`, `thresholds`, and `children` must have the same length, and every weight vector must have one entry per feature. Weights, thresholds, and child references cannot be `NULL`; leaf values may be. All nodes and leaf values must be reachable from the root. Cycles and shared internal nodes are not allowed.
 
 ## Example
 
@@ -60,7 +62,7 @@ CREATE MACRO example_tree() AS {
     ],
     thresholds: [0.0, 10.0],
     children: [
-        [1, -1],
+        [2, -1],
         [-3, -2]
     ],
     values: ['negative', 'low', 'high']

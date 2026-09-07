@@ -7,7 +7,12 @@ import statistics
 import subprocess
 from pathlib import Path
 
-from run_benchmarks import TIMER_PATTERN, float_literal, list_literal
+from run_benchmarks import (
+    TIMER_PATTERN,
+    float_literal,
+    list_literal,
+    public_reference,
+)
 from run_small_feature_benchmark import make_tree, reference_expression
 
 
@@ -69,7 +74,8 @@ def tree_literal(tree, payload):
     )
     threshold_values = list_literal(float_literal(value) for value in thresholds)
     child_rows = list_literal(
-        f"[{above},{below}]" for above, below in zip(right_children, left_children)
+        f"[{public_reference(above)},{public_reference(below)}]"
+        for above, below in zip(right_children, left_children)
     )
     leaf_count = max(
         -reference

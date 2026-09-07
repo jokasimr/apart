@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from run_benchmarks import TIMER_PATTERN, float_literal, list_literal
+from run_benchmarks import TIMER_PATTERN, float_literal, list_literal, public_reference
 
 
 LEAF_COUNTS = (1023, 1024, 1025)
@@ -63,13 +63,13 @@ def tree_literal(payload, leaf_count):
             below = make_leaf()
             above = make_leaf()
             thresholds[node] = float_literal(1.0 / (1 << (BASE_DEPTH + 1)))
-            children[node] = f"[{above},{below}]"
+            children[node] = f"[{public_reference(above)},{public_reference(below)}]"
             return node
 
         below = make_node(depth + 1, position * 2)
         above = make_node(depth + 1, position * 2 + 1)
         thresholds[node] = float_literal((2 * position + 1) / (1 << (depth + 1)))
-        children[node] = f"[{above},{below}]"
+        children[node] = f"[{public_reference(above)},{public_reference(below)}]"
         return node
 
     root = make_node(0, 0)
