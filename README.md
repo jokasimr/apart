@@ -34,6 +34,8 @@ sum(weights[i][j] * x[j]) >= thresholds[i]
 
 If the condition is true, evaluation follows the first child reference (`above`). Otherwise, it follows the second (`below`). Equality therefore follows `above`.
 
+> **NaN:** Node comparisons use native IEEE floating-point semantics, not DuckDB's SQL ordering for NaN. If the score or threshold is NaN, the condition is false and evaluation follows `below`.
+
 Child references use this encoding:
 
 ```text
