@@ -38,6 +38,13 @@ and 9:
 python3 benchmark/run_small_feature_benchmark.py --duckdb build/release/duckdb
 ```
 
+The NULL-fraction benchmark measures a balanced depth-10 tree with three `FLOAT` features and `INTEGER` leaves. It
+compares uniformly scattered NULL fractions from 0% through 100% using flat input vectors:
+
+```sh
+python3 benchmark/run_null_fraction_benchmark.py --duckdb build/release/duckdb
+```
+
 The output-encoding benchmark checks flat primitive output and compares dictionary and flat output for an expensive
 child immediately below and above the leaf-count threshold. It uses near-identical variable-depth trees with 1,023 and
 1,025 leaves, plus a 1,024-leaf equal-depth control. It measures `FLOAT` leaves and the list child of `STRUCT` leaves:

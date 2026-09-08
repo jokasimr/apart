@@ -5,6 +5,9 @@
 require dtree
 
 statement ok
+PRAGMA verify_serializer
+
+statement ok
 CREATE MACRO one_node_tree(node_weights, node_threshold, below_value, above_value) AS {
     weights: [node_weights],
     thresholds: [node_threshold],
@@ -212,8 +215,8 @@ WHERE decision_tree(fixed_depth_test_tree(), x0, x1, x2)
 ----
 0
 
-# Fixed kernels cover one through five features; larger feature counts use the generic kernel.
-query TTTT
+# Fixed kernels cover one through seven features; larger feature counts use the generic kernel.
+query TTTTTTTT
 SELECT
     decision_tree(
         one_node_tree([1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE], 10, 'low', 'high'),
@@ -230,14 +233,31 @@ SELECT
     decision_tree(
         one_node_tree([1, 1, 1, 1, 1, 1], 22, 'low', 'high'),
         [1, 2, 3, 4, 5, 6]::DOUBLE[6]
+    ),
+    decision_tree(
+        one_node_tree([1, 1, 1, 1, 1, 1, 1], 28, 'low', 'high'),
+        1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT, 4.0::FLOAT, 5.0::FLOAT, 6.0::FLOAT, 7.0::FLOAT
+    ),
+    decision_tree(
+        one_node_tree([1, 1, 1, 1, 1, 1, 1], 29, 'low', 'high'),
+        [1, 2, 3, 4, 5, 6, 7]::DOUBLE[7]
+    ),
+    decision_tree(
+        one_node_tree([1, 1, 1, 1, 1, 1, 1, 1], 36, 'low', 'high'),
+        1.0::FLOAT, 2.0::FLOAT, 3.0::FLOAT, 4.0::FLOAT,
+        5.0::FLOAT, 6.0::FLOAT, 7.0::FLOAT, 8.0::FLOAT
+    ),
+    decision_tree(
+        one_node_tree([1, 1, 1, 1, 1, 1, 1, 1], 37, 'low', 'high'),
+        [1, 2, 3, 4, 5, 6, 7, 8]::DOUBLE[8]
     );
 ----
-high	low	high	low
+high	low	high	low	high	low	high	low
 
 # The generic kernel handles variable-depth topology for column and array inputs.
 statement ok
-CREATE MACRO generic_six_tree() AS {
-    weights: [[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]],
+CREATE MACRO generic_eight_tree() AS {
+    weights: [[1, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 1]],
     thresholds: [0, 0],
     children: [[2, -1], [-3, -2]],
     values: ['left', 'middle', 'right']
@@ -248,16 +268,70 @@ SELECT count(*)
 FROM (
     SELECT
         CASE i % 3 WHEN 0 THEN -1.0::FLOAT ELSE 1.0::FLOAT END AS x0,
-        CASE i % 3 WHEN 1 THEN -1.0::FLOAT ELSE 1.0::FLOAT END AS x1,
+        0.0::FLOAT AS x1,
         0.0::FLOAT AS x2,
         0.0::FLOAT AS x3,
         0.0::FLOAT AS x4,
         0.0::FLOAT AS x5,
+        0.0::FLOAT AS x6,
+        CASE i % 3 WHEN 1 THEN -1.0::FLOAT ELSE 1.0::FLOAT END AS x7,
         CASE i % 3 WHEN 0 THEN 'left' WHEN 1 THEN 'middle' ELSE 'right' END AS expected
-    FROM range(10000) rows(i)
+    FROM range(10003) rows(i)
 ) features
-WHERE decision_tree(generic_six_tree(), x0, x1, x2, x3, x4, x5) IS DISTINCT FROM expected
-   OR decision_tree(generic_six_tree(), [x0, x1, x2, x3, x4, x5]::FLOAT[6]) IS DISTINCT FROM expected;
+WHERE decision_tree(generic_eight_tree(), x0, x1, x2, x3, x4, x5, x6, x7) IS DISTINCT FROM expected
+   OR decision_tree(generic_eight_tree(), [x0, x1, x2, x3, x4, x5, x6, x7]::FLOAT[8]) IS DISTINCT FROM expected
+   OR decision_tree(generic_eight_tree(), [x0, x1, x2, x3, x4, x5, x6, x7]::DOUBLE[8]) IS DISTINCT FROM expected;
+----
+0
+
+# Exercise multi-level N=7 fixed and N=8 generic kernels in their other topology modes.
+statement ok
+CREATE MACRO variable_depth_seven_tree() AS {
+    weights: [[1, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 1]],
+    thresholds: [0, 0],
+    children: [[2, -1], [-3, -2]],
+    values: [10, 20, 30]
+};
+
+statement ok
+CREATE MACRO equal_depth_eight_tree() AS {
+    weights: [
+        [1, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1]
+    ],
+    thresholds: [0, 0, 0],
+    children: [[3, 2], [-2, -1], [-4, -3]],
+    values: [10, 20, 30, 40]
+};
+
+query I
+SELECT count(*)
+FROM (
+    SELECT
+        CASE i % 4 WHEN 0 THEN -1.0::FLOAT WHEN 1 THEN -1.0::FLOAT ELSE 1.0::FLOAT END AS x0,
+        0.0::FLOAT AS x1,
+        0.0::FLOAT AS x2,
+        0.0::FLOAT AS x3,
+        0.0::FLOAT AS x4,
+        0.0::FLOAT AS x5,
+        CASE i % 3 WHEN 1 THEN -1.0::FLOAT ELSE 1.0::FLOAT END AS x6,
+        CASE i % 4 WHEN 0 THEN -1.0::FLOAT WHEN 2 THEN -1.0::FLOAT ELSE 1.0::FLOAT END AS x7
+    FROM range(10003) rows(i)
+) features
+WHERE decision_tree(variable_depth_seven_tree(), x0, x1, x2, x3, x4, x5, x6)
+          IS DISTINCT FROM CASE WHEN x0 < 0 THEN 10 WHEN x6 < 0 THEN 20 ELSE 30 END
+   OR decision_tree(variable_depth_seven_tree(), [x0, x1, x2, x3, x4, x5, x6]::DOUBLE[7])
+          IS DISTINCT FROM CASE WHEN x0 < 0 THEN 10 WHEN x6 < 0 THEN 20 ELSE 30 END
+   OR decision_tree(
+          equal_depth_eight_tree(),
+          x0::DOUBLE, x1::DOUBLE, x2::DOUBLE, x3::DOUBLE,
+          x4::DOUBLE, x5::DOUBLE, x6::DOUBLE, x7::DOUBLE
+      ) IS DISTINCT FROM CASE WHEN x0 < 0 THEN CASE WHEN x7 < 0 THEN 10 ELSE 20 END
+                              ELSE CASE WHEN x7 < 0 THEN 30 ELSE 40 END END
+   OR decision_tree(equal_depth_eight_tree(), [x0, x1, x2, x3, x4, x5, x6, x7]::FLOAT[8])
+          IS DISTINCT FROM CASE WHEN x0 < 0 THEN CASE WHEN x7 < 0 THEN 10 ELSE 20 END
+                                ELSE CASE WHEN x7 < 0 THEN 30 ELSE 40 END END;
 ----
 0
 
@@ -347,6 +421,71 @@ SELECT typeof(decision_tree(
 ));
 ----
 INTEGER
+
+# Constant NULL features produce constant NULL results without evaluating feature payloads.
+query T
+SELECT DISTINCT vector_type(decision_tree(
+    one_node_tree([1, 0], 0, 10, 20),
+    NULL::FLOAT,
+    i::FLOAT
+))
+FROM range(4096) rows(i);
+----
+CONSTANT_VECTOR
+
+query TTTT
+SELECT
+    vector_type(decision_tree(one_node_tree([1, 0], 0, 10, 20), 1.0::FLOAT, 0.0::FLOAT)),
+    vector_type(decision_tree(one_node_tree([1, 0], 0, 10, 20), [NULL::FLOAT, 0.0::FLOAT]::FLOAT[2])),
+    vector_type(decision_tree(
+        generic_eight_tree(),
+        NULL::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+        0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT
+    )),
+    vector_type(decision_tree(
+        generic_eight_tree(),
+        [NULL::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+         0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT]::FLOAT[8]
+    ));
+----
+CONSTANT_VECTOR	CONSTANT_VECTOR	CONSTANT_VECTOR	CONSTANT_VECTOR
+
+# NULL masks may differ between features and cross validity-word and chunk boundaries.
+query I
+SELECT count(*)
+FROM (
+    SELECT
+        CASE WHEN i % 67 = 0 THEN NULL ELSE (i % 3 - 1)::FLOAT END AS x0,
+        CASE WHEN i % 71 = 0 THEN NULL ELSE 0.0::FLOAT END AS x1,
+        CASE WHEN i % 73 = 0 THEN NULL ELSE (i % 5 - 2)::FLOAT END AS x2
+    FROM range(4099) rows(i)
+) features
+WHERE decision_tree(fixed_depth_test_tree(), x0, x1, x2)
+          IS DISTINCT FROM CASE
+              WHEN x0 IS NULL OR x1 IS NULL OR x2 IS NULL THEN NULL
+              WHEN x0 >= 0 THEN CASE WHEN x2 >= 0 THEN 40 ELSE 30 END
+              ELSE CASE WHEN x1 >= 0 THEN 20 ELSE 10 END
+          END
+   OR decision_tree(fixed_depth_test_tree(), [x0, x1, x2]::FLOAT[3])
+          IS DISTINCT FROM decision_tree(fixed_depth_test_tree(), x0, x1, x2);
+----
+0
+
+# Parent ARRAY NULLs and NULL elements both produce NULL output.
+query I
+SELECT count(*)
+FROM (VALUES
+    (NULL::FLOAT[8], NULL::VARCHAR),
+    ([NULL::FLOAT, 0, 0, 0, 0, 0, 0, 0]::FLOAT[8], NULL::VARCHAR),
+    ([-1, 0, 0, 0, 0, 0, 0, 1]::FLOAT[8], 'left'),
+    ([1, 0, 0, 0, 0, 0, 0, -1]::FLOAT[8], 'middle'),
+    ([1, 0, 0, 0, 0, 0, 0, 1]::FLOAT[8], 'right')
+) features(x, expected)
+WHERE decision_tree(generic_eight_tree(), x) IS DISTINCT FROM expected
+   OR decision_tree(generic_eight_tree(), x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8])
+          IS DISTINCT FROM expected;
+----
+0
 
 # Variable-depth trees use the same indexed representation.
 query I

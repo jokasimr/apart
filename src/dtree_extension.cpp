@@ -84,6 +84,14 @@ struct ImplicitFixedNode {
 	T threshold;
 };
 
+template <>
+struct alignas(16) ImplicitFixedNode<float, 2> {
+	float coefficients[2];
+	float threshold;
+};
+
+static_assert(sizeof(ImplicitFixedNode<float, 2>) == 16, "FLOAT N=2 implicit nodes must have a 16-byte stride");
+
 template <class T, idx_t N>
 struct FixedTree final : CompiledTree {
 	explicit FixedTree(const ParsedTree &tree) : CompiledTree(tree, N) {
@@ -480,6 +488,10 @@ static shared_ptr<CompiledTree> CompileTree(const ParsedTree &tree, idx_t dimens
 		return CompileFixedTree<T, 4>(tree);
 	case 5:
 		return CompileFixedTree<T, 5>(tree);
+	case 6:
+		return CompileFixedTree<T, 6>(tree);
+	case 7:
+		return CompileFixedTree<T, 7>(tree);
 	default:
 		return CompileGenericTree<T>(tree, dimensions);
 	}
@@ -513,6 +525,16 @@ struct GenericArrayInput {
 	}
 };
 
+template <class T, class INPUT>
+struct OffsetInput {
+	const INPUT &input;
+	idx_t offset;
+
+	inline T Get(idx_t feature, idx_t row) const {
+		return input.Get(feature, row + offset);
+	}
+};
+
 template <idx_t FEATURE, class T, idx_t N, class INPUT>
 struct FixedScore {
 	template <class NODE>
@@ -532,8 +554,8 @@ struct FixedScore<N, T, N, INPUT> {
 template <class T, idx_t N, class INPUT>
 static inline uint32_t AdvanceFixed(const FixedNode<T, N> *nodes, const INPUT &input, idx_t row, uint32_t reference) {
 	auto &node = nodes[reference];
-	T score = 0;
-	FixedScore<0, T, N, INPUT>::Accumulate(score, node, input, row);
+	T score = node.coefficients[0] * input.Get(0, row);
+	FixedScore<1, T, N, INPUT>::Accumulate(score, node, input, row);
 	return node.children[static_cast<idx_t>(score >= node.threshold)];
 }
 
@@ -541,8 +563,8 @@ template <class T, idx_t N, class INPUT>
 static inline uint32_t AdvanceImplicitFixed(const ImplicitFixedNode<T, N> *nodes, const INPUT &input, idx_t row,
                                             uint32_t reference) {
 	auto &node = nodes[reference];
-	T score = 0;
-	FixedScore<0, T, N, INPUT>::Accumulate(score, node, input, row);
+	T score = node.coefficients[0] * input.Get(0, row);
+	FixedScore<1, T, N, INPUT>::Accumulate(score, node, input, row);
 	return 2 * reference + 1 + static_cast<uint32_t>(score >= node.threshold);
 }
 
@@ -648,28 +670,32 @@ static void EvaluateFixedTree(const FixedTree<T, N> &tree, const INPUT &input, i
 	}
 }
 
-template <bool CHECK_ACTIVE, idx_t LANE, class T, class INPUT>
-static inline void AccumulateGenericLane(const T *coefficients, const INPUT &input, idx_t feature, idx_t row,
-                                         uint8_t active, const uint32_t (&references)[BLOCK_SIZE],
-                                         T (&scores)[BLOCK_SIZE]) {
+template <bool CHECK_ACTIVE, bool INITIALIZE, idx_t LANE, class T, class INPUT>
+static inline void UpdateGenericLane(const T *coefficients, const INPUT &input, idx_t feature, idx_t row,
+                                     uint8_t active, const uint32_t (&references)[BLOCK_SIZE],
+                                     T (&scores)[BLOCK_SIZE]) {
 	constexpr auto lane_bit = static_cast<uint8_t>(uint8_t(1) << LANE);
 	if (!CHECK_ACTIVE || (active & lane_bit)) {
-		scores[LANE] += coefficients[references[LANE]] * input.Get(feature, row + LANE);
+		auto product = coefficients[references[LANE]] * input.Get(feature, row + LANE);
+		if (INITIALIZE) {
+			scores[LANE] = product;
+		} else {
+			scores[LANE] += product;
+		}
 	}
 }
 
-template <bool CHECK_ACTIVE, class T, class INPUT>
-static inline void AccumulateGeneric(const T *coefficients, const INPUT &input, idx_t feature, idx_t row,
-                                     uint8_t active, const uint32_t (&references)[BLOCK_SIZE],
-                                     T (&scores)[BLOCK_SIZE]) {
-	AccumulateGenericLane<CHECK_ACTIVE, 0>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 1>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 2>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 3>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 4>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 5>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 6>(coefficients, input, feature, row, active, references, scores);
-	AccumulateGenericLane<CHECK_ACTIVE, 7>(coefficients, input, feature, row, active, references, scores);
+template <bool CHECK_ACTIVE, bool INITIALIZE, class T, class INPUT>
+static inline void UpdateGeneric(const T *coefficients, const INPUT &input, idx_t feature, idx_t row, uint8_t active,
+                                 const uint32_t (&references)[BLOCK_SIZE], T (&scores)[BLOCK_SIZE]) {
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 0>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 1>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 2>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 3>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 4>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 5>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 6>(coefficients, input, feature, row, active, references, scores);
+	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 7>(coefficients, input, feature, row, active, references, scores);
 }
 
 template <bool CHECK_ACTIVE, idx_t LANE, class T>
@@ -689,11 +715,12 @@ static inline void SelectGenericLane(const GenericNode<T> *nodes, uint8_t active
 template <bool CHECK_ACTIVE, class T, class INPUT>
 static inline void AdvanceGenericBlock(const GenericTree<T> &tree, const INPUT &input, idx_t row, uint8_t active,
                                        uint32_t (&references)[BLOCK_SIZE], uint8_t &next_active) {
-	T scores[BLOCK_SIZE] {};
+	T scores[BLOCK_SIZE];
 	auto node_count = tree.nodes.size();
-	for (idx_t feature = 0; feature < tree.dimensions; feature++) {
+	UpdateGeneric<CHECK_ACTIVE, true>(tree.coefficients.data(), input, 0, row, active, references, scores);
+	for (idx_t feature = 1; feature < tree.dimensions; feature++) {
 		auto coefficients = tree.coefficients.data() + feature * node_count;
-		AccumulateGeneric<CHECK_ACTIVE>(coefficients, input, feature, row, active, references, scores);
+		UpdateGeneric<CHECK_ACTIVE, false>(coefficients, input, feature, row, active, references, scores);
 	}
 	auto nodes = tree.nodes.data();
 	SelectGenericLane<CHECK_ACTIVE, 0>(nodes, active, references, scores, next_active);
@@ -710,8 +737,8 @@ template <class T, class INPUT>
 static inline uint32_t TraverseGeneric(const GenericTree<T> &tree, const INPUT &input, idx_t row) {
 	auto reference = tree.root;
 	while (!IsLeaf(reference)) {
-		T score = 0;
-		for (idx_t feature = 0; feature < tree.dimensions; feature++) {
+		T score = tree.coefficients[reference] * input.Get(0, row);
+		for (idx_t feature = 1; feature < tree.dimensions; feature++) {
 			score += tree.coefficients[feature * tree.nodes.size() + reference] * input.Get(feature, row);
 		}
 		auto &node = tree.nodes[reference];
@@ -746,6 +773,93 @@ static void EvaluateGenericTree(const GenericTree<T> &tree, const INPUT &input, 
 
 	for (; row < count; row++) {
 		leaf_indices[row] = LeafIndex(TraverseGeneric(tree, input, row));
+	}
+}
+
+template <class T, idx_t N>
+struct FixedTreeEvaluator {
+	const FixedTree<T, N> &tree;
+
+	template <class INPUT>
+	void operator()(const INPUT &input, idx_t count, sel_t *leaf_indices) const {
+		EvaluateFixedTree(tree, input, count, leaf_indices);
+	}
+};
+
+template <class T>
+struct GenericTreeEvaluator {
+	const GenericTree<T> &tree;
+
+	template <class INPUT>
+	void operator()(const INPUT &input, idx_t count, sel_t *leaf_indices) const {
+		EvaluateGenericTree(tree, input, count, leaf_indices);
+	}
+};
+
+template <class T, class INPUT, class ROW_VALID, class EVALUATE>
+static void EvaluateValidRuns(const INPUT &input, idx_t count, idx_t null_leaf, sel_t *leaf_indices,
+                              ROW_VALID &&row_valid, EVALUATE &&evaluate) {
+	idx_t row = 0;
+	while (row < count) {
+		if (!row_valid(row)) {
+			leaf_indices[row++] = null_leaf;
+			continue;
+		}
+
+		auto begin = row++;
+		while (row < count && row_valid(row)) {
+			row++;
+		}
+		OffsetInput<T, INPUT> offset_input {input, begin};
+		evaluate(offset_input, row - begin, leaf_indices + begin);
+	}
+}
+
+template <class T, class INPUT, class VALIDITY_ENTRY, class EVALUATE>
+static void EvaluateValidityEntries(const INPUT &input, idx_t count, idx_t null_leaf, sel_t *leaf_indices,
+                                    VALIDITY_ENTRY &&validity_entry, EVALUATE &&evaluate) {
+	idx_t row = 0;
+	idx_t entry_idx = 0;
+	while (row < count) {
+		auto entry_count = MinValue<idx_t>(ValidityMask::BITS_PER_VALUE, count - row);
+		auto valid_bits = ValidityMask::EntryWithValidBits(entry_count);
+		auto entry = validity_entry(entry_idx) & valid_bits;
+		if (entry == valid_bits) {
+			auto begin = row;
+			do {
+				row += entry_count;
+				entry_idx++;
+				if (row == count) {
+					break;
+				}
+				entry_count = MinValue<idx_t>(ValidityMask::BITS_PER_VALUE, count - row);
+				valid_bits = ValidityMask::EntryWithValidBits(entry_count);
+				entry = validity_entry(entry_idx) & valid_bits;
+			} while (entry == valid_bits);
+			OffsetInput<T, INPUT> offset_input {input, begin};
+			evaluate(offset_input, row - begin, leaf_indices + begin);
+			continue;
+		} else if (entry == 0) {
+			for (idx_t lane = 0; lane < entry_count; lane++) {
+				leaf_indices[row + lane] = null_leaf;
+			}
+		} else {
+			idx_t lane = 0;
+			while (lane < entry_count) {
+				if (!ValidityMask::RowIsValid(entry, lane)) {
+					leaf_indices[row + lane++] = null_leaf;
+					continue;
+				}
+				auto begin = lane++;
+				while (lane < entry_count && ValidityMask::RowIsValid(entry, lane)) {
+					lane++;
+				}
+				OffsetInput<T, INPUT> offset_input {input, row + begin};
+				evaluate(offset_input, lane - begin, leaf_indices + row + begin);
+			}
+		}
+		row += entry_count;
+		entry_idx++;
 	}
 }
 
@@ -866,49 +980,52 @@ static void EmitLeaves(const CompiledTree &tree, const SelectionVector &leaf_ind
 	}
 }
 
-static bool ApplyColumnNulls(DataChunk &args, idx_t count, idx_t null_leaf, SelectionVector &leaf_indices) {
-	bool found_null = false;
+static bool ColumnsAllValid(const DataChunk &args, idx_t count) {
 	for (auto &input : args.data) {
-		auto &validity = FlatVector::Validity(input);
-		if (!validity.AllValid()) {
-			for (idx_t row = 0; row < count; row++) {
-				if (!validity.RowIsValid(row)) {
-					leaf_indices.set_index(row, null_leaf);
-					found_null = true;
-				}
-			}
+		if (!FlatVector::Validity(input).CheckAllValid(count)) {
+			return false;
 		}
 	}
-	return found_null;
+	return true;
 }
 
-static bool ApplyArrayNulls(Vector &arrays, Vector &elements, idx_t dimensions, idx_t count, idx_t null_leaf,
-                            SelectionVector &leaf_indices) {
-	auto &array_validity = FlatVector::Validity(arrays);
-	auto &element_validity = FlatVector::Validity(elements);
-	auto elements_all_valid = element_validity.AllValid();
-	if (array_validity.AllValid() && elements_all_valid) {
+static validity_t ColumnValidityEntry(const DataChunk &args, idx_t entry_idx) {
+	auto result = ValidityMask::ValidityBuffer::MAX_ENTRY;
+	for (auto &input : args.data) {
+		result &= FlatVector::Validity(input).GetValidityEntry(entry_idx);
+	}
+	return result;
+}
+
+static bool ArrayRowIsValid(const ValidityMask &array_validity, const ValidityMask &element_validity,
+                            bool elements_all_valid, idx_t dimensions, idx_t row) {
+	if (!array_validity.RowIsValid(row)) {
 		return false;
 	}
-	bool found_null = false;
-	for (idx_t row = 0; row < count; row++) {
-		if (!array_validity.RowIsValid(row)) {
-			leaf_indices.set_index(row, null_leaf);
-			found_null = true;
-			continue;
-		}
-		if (!elements_all_valid) {
-			auto offset = row * dimensions;
-			for (idx_t feature = 0; feature < dimensions; feature++) {
-				if (!element_validity.RowIsValid(offset + feature)) {
-					leaf_indices.set_index(row, null_leaf);
-					found_null = true;
-					break;
-				}
-			}
+	if (elements_all_valid) {
+		return true;
+	}
+	auto offset = row * dimensions;
+	for (idx_t feature = 0; feature < dimensions; feature++) {
+		if (!element_validity.RowIsValid(offset + feature)) {
+			return false;
 		}
 	}
-	return found_null;
+	return true;
+}
+
+static void SetConstantNull(Vector &result) {
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, true);
+}
+
+static bool HasConstantNull(const DataChunk &args) {
+	for (auto &input : args.data) {
+		if (input.GetVectorType() == VectorType::CONSTANT_VECTOR && ConstantVector::IsNull(input)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 template <class T, idx_t N>
@@ -916,6 +1033,10 @@ static void ExecuteFixedColumns(DataChunk &args, ExpressionState &state, Vector 
 	auto &tree = static_cast<const FixedTree<T, N> &>(GetTree(state));
 	auto &local_state = GetLocalState<T>(state);
 	D_ASSERT(args.ColumnCount() == N);
+	if (HasConstantNull(args)) {
+		SetConstantNull(result);
+		return;
+	}
 	auto all_constant = args.AllConstant();
 	auto count = all_constant ? idx_t(1) : args.size();
 	for (idx_t feature = 0; feature < N; feature++) {
@@ -927,8 +1048,15 @@ static void ExecuteFixedColumns(DataChunk &args, ExpressionState &state, Vector 
 	}
 
 	ColumnInput<T> input {local_state.features.data()};
-	EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
-	auto selected_null = ApplyColumnNulls(args, count, tree.leaf_count, local_state.leaf_indices);
+	bool selected_null = false;
+	if (ColumnsAllValid(args, count)) {
+		EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
+	} else {
+		selected_null = true;
+		EvaluateValidityEntries<T>(
+		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
+		    [&](idx_t entry_idx) { return ColumnValidityEntry(args, entry_idx); }, FixedTreeEvaluator<T, N> {tree});
+	}
 	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
@@ -937,9 +1065,13 @@ static void ExecuteFixedArray(DataChunk &args, ExpressionState &state, Vector &r
 	auto &tree = static_cast<const FixedTree<T, N> &>(GetTree(state));
 	auto &local_state = GetLocalState<T>(state);
 	D_ASSERT(args.ColumnCount() == 1);
-	auto all_constant = args.AllConstant();
-	auto count = all_constant ? idx_t(1) : args.size();
 	auto &arrays = args.data[0];
+	auto all_constant = arrays.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	if (all_constant && ConstantVector::IsNull(arrays)) {
+		SetConstantNull(result);
+		return;
+	}
+	auto count = all_constant ? idx_t(1) : args.size();
 	if (arrays.GetVectorType() != VectorType::FLAT_VECTOR) {
 		arrays.Flatten(count);
 	}
@@ -949,8 +1081,24 @@ static void ExecuteFixedArray(DataChunk &args, ExpressionState &state, Vector &r
 	}
 
 	FixedArrayInput<T, N> input {FlatVector::GetData<T>(elements)};
-	EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
-	auto selected_null = ApplyArrayNulls(arrays, elements, N, count, tree.leaf_count, local_state.leaf_indices);
+	auto &array_validity = FlatVector::Validity(arrays);
+	auto &element_validity = FlatVector::Validity(elements);
+	auto elements_all_valid = element_validity.CheckAllValid(count * N);
+	auto all_valid = array_validity.CheckAllValid(count) && elements_all_valid;
+	if (all_constant && !all_valid) {
+		SetConstantNull(result);
+		return;
+	}
+	bool selected_null = false;
+	if (all_valid) {
+		EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
+	} else {
+		selected_null = true;
+		EvaluateValidRuns<T>(
+		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
+		    [&](idx_t row) { return ArrayRowIsValid(array_validity, element_validity, elements_all_valid, N, row); },
+		    FixedTreeEvaluator<T, N> {tree});
+	}
 	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
@@ -959,6 +1107,10 @@ static void ExecuteGenericColumns(DataChunk &args, ExpressionState &state, Vecto
 	auto &tree = static_cast<const GenericTree<T> &>(GetTree(state));
 	auto &local_state = GetLocalState<T>(state);
 	D_ASSERT(args.ColumnCount() == tree.dimensions);
+	if (HasConstantNull(args)) {
+		SetConstantNull(result);
+		return;
+	}
 	auto all_constant = args.AllConstant();
 	auto count = all_constant ? idx_t(1) : args.size();
 	for (idx_t feature = 0; feature < tree.dimensions; feature++) {
@@ -970,8 +1122,15 @@ static void ExecuteGenericColumns(DataChunk &args, ExpressionState &state, Vecto
 	}
 
 	ColumnInput<T> input {local_state.features.data()};
-	EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
-	auto selected_null = ApplyColumnNulls(args, count, tree.leaf_count, local_state.leaf_indices);
+	bool selected_null = false;
+	if (ColumnsAllValid(args, count)) {
+		EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
+	} else {
+		selected_null = true;
+		EvaluateValidityEntries<T>(
+		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
+		    [&](idx_t entry_idx) { return ColumnValidityEntry(args, entry_idx); }, GenericTreeEvaluator<T> {tree});
+	}
 	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
@@ -980,9 +1139,13 @@ static void ExecuteGenericArray(DataChunk &args, ExpressionState &state, Vector 
 	auto &tree = static_cast<const GenericTree<T> &>(GetTree(state));
 	auto &local_state = GetLocalState<T>(state);
 	D_ASSERT(args.ColumnCount() == 1);
-	auto all_constant = args.AllConstant();
-	auto count = all_constant ? idx_t(1) : args.size();
 	auto &arrays = args.data[0];
+	auto all_constant = arrays.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	if (all_constant && ConstantVector::IsNull(arrays)) {
+		SetConstantNull(result);
+		return;
+	}
+	auto count = all_constant ? idx_t(1) : args.size();
 	if (arrays.GetVectorType() != VectorType::FLAT_VECTOR) {
 		arrays.Flatten(count);
 	}
@@ -992,9 +1155,26 @@ static void ExecuteGenericArray(DataChunk &args, ExpressionState &state, Vector 
 	}
 
 	GenericArrayInput<T> input {FlatVector::GetData<T>(elements), tree.dimensions};
-	EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
-	auto selected_null =
-	    ApplyArrayNulls(arrays, elements, tree.dimensions, count, tree.leaf_count, local_state.leaf_indices);
+	auto &array_validity = FlatVector::Validity(arrays);
+	auto &element_validity = FlatVector::Validity(elements);
+	auto elements_all_valid = element_validity.CheckAllValid(count * tree.dimensions);
+	auto all_valid = array_validity.CheckAllValid(count) && elements_all_valid;
+	if (all_constant && !all_valid) {
+		SetConstantNull(result);
+		return;
+	}
+	bool selected_null = false;
+	if (all_valid) {
+		EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
+	} else {
+		selected_null = true;
+		EvaluateValidRuns<T>(
+		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
+		    [&](idx_t row) {
+			    return ArrayRowIsValid(array_validity, element_validity, elements_all_valid, tree.dimensions, row);
+		    },
+		    GenericTreeEvaluator<T> {tree});
+	}
 	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
@@ -1026,6 +1206,12 @@ static void ConfigureFunction(ScalarFunction &function, idx_t dimensions, bool a
 		case 5:
 			function.SetFunctionCallback(ExecuteFixedArray<T, 5>);
 			return;
+		case 6:
+			function.SetFunctionCallback(ExecuteFixedArray<T, 6>);
+			return;
+		case 7:
+			function.SetFunctionCallback(ExecuteFixedArray<T, 7>);
+			return;
 		default:
 			function.SetFunctionCallback(ExecuteGenericArray<T>);
 			return;
@@ -1047,6 +1233,12 @@ static void ConfigureFunction(ScalarFunction &function, idx_t dimensions, bool a
 		return;
 	case 5:
 		function.SetFunctionCallback(ExecuteFixedColumns<T, 5>);
+		return;
+	case 6:
+		function.SetFunctionCallback(ExecuteFixedColumns<T, 6>);
+		return;
+	case 7:
+		function.SetFunctionCallback(ExecuteFixedColumns<T, 7>);
 		return;
 	default:
 		function.SetFunctionCallback(ExecuteGenericColumns<T>);
