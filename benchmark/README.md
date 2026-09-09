@@ -38,6 +38,34 @@ and 9:
 python3 benchmark/run_small_feature_benchmark.py --duckdb build/release/duckdb
 ```
 
+The stress correctness suite covers both overloads across fixed and generic feature counts, equal- and variable-depth
+trees, nullable inputs, and primitive and nested leaf types:
+
+```sh
+python3 benchmark/run_stress_tests.py --duckdb build/release/duckdb
+```
+
+The stress performance suite is a broad regression screen over dimensions, depth, shape, NULL fraction, and leaf
+type. Its DuckDB CLI timings are intended to expose substantial regressions, not sub-nanosecond differences. Individual
+suites or cases can be selected with `--suite` and `--case`.
+
+```sh
+python3 benchmark/run_stress_performance.py --duckdb build/release/duckdb
+```
+
+The YDF comparison measures identical affine trees and inputs with the two `decision_tree` overloads, Yggdrasil
+Decision Forests' generic C++ engine, YDF's dependency-free `ROUTING` C++ export, and a minimal standalone C++
+control. It covers 1-10 features, depths 3-10, and additional skewed and variable-depth cases. All inference is
+single-threaded, setup is outside the timed regions, and complete output checksums must agree.
+
+The standalone columns time only prediction and output writes. The YDF engine column uses YDF's C++ serving
+benchmark. The DuckDB columns include table scanning, the scalar function, and a sum that consumes its output.
+
+```sh
+python3 -m pip install ydf
+python3 benchmark/run_ydf_comparison.py --duckdb build/release/duckdb
+```
+
 The NULL-fraction benchmark measures a balanced depth-10 tree with three `FLOAT` features and `INTEGER` leaves. It
 compares uniformly scattered NULL fractions from 0% through 100% using flat input vectors:
 
