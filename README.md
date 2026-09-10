@@ -1,6 +1,6 @@
-# dtree
+# apart
 
-`dtree` is a DuckDB extension for evaluating affine binary decision trees directly in SQL. It is intended for applying a fixed tree efficiently to many rows while keeping both the data and the computation inside DuckDB.
+`apart` is a DuckDB extension for evaluating affine, or oblique, decision trees directly in SQL. It applies a fixed tree efficiently to many rows while keeping both the data and the computation inside DuckDB.
 
 ## Usage
 
@@ -55,7 +55,7 @@ The root is always node `1`. `weights`, `thresholds`, and `children` must have t
 This tree returns `negative` when `x < 0`. Otherwise, it returns `low` when `y < 10` and `high` when `y >= 10`.
 
 ```sql
-LOAD dtree;
+LOAD apart;
 
 CREATE MACRO example_tree() AS {
     weights: [

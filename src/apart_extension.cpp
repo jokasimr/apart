@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "dtree_extension.hpp"
+#include "apart_extension.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
@@ -1363,17 +1363,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 } // namespace
 
-void DtreeExtension::Load(ExtensionLoader &loader) {
+void ApartExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 
-std::string DtreeExtension::Name() {
-	return "dtree";
+std::string ApartExtension::Name() {
+	return "apart";
 }
 
-std::string DtreeExtension::Version() const {
-#ifdef EXT_VERSION_DTREE
-	return EXT_VERSION_DTREE;
+std::string ApartExtension::Version() const {
+#ifdef EXT_VERSION_APART
+	return EXT_VERSION_APART;
 #else
 	return "";
 #endif
@@ -1383,7 +1383,7 @@ std::string DtreeExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(dtree, loader) { // NOLINT
+DUCKDB_CPP_EXTENSION_ENTRY(apart, loader) { // NOLINT
 	duckdb::LoadInternal(loader);
 }
 }

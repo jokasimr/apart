@@ -240,7 +240,7 @@ def build_sql(performance_case, warmups, runs, seed):
         ".mode csv",
         ".headers off",
         ".echo off",
-        "LOAD dtree;",
+        "LOAD apart;",
         "PRAGMA threads=1;",
         "PRAGMA preserve_insertion_order=false;",
         f"""

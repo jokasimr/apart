@@ -1,8 +1,8 @@
-# name: test/sql/dtree.test
+# name: test/sql/apart.test
 # description: decision_tree scalar function
 # group: [sql]
 
-require dtree
+require apart
 
 statement ok
 PRAGMA verify_serializer

@@ -1,7 +1,7 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
 
 # Extension from this repo
-duckdb_extension_load(dtree
+duckdb_extension_load(apart
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
 )
 

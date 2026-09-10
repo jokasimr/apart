@@ -130,7 +130,7 @@ def build_sql(
         ".mode csv",
         ".headers off",
         ".echo off",
-        "LOAD dtree;",
+        "LOAD apart;",
         "PRAGMA threads=1;",
         "PRAGMA preserve_insertion_order=false;",
         feature_table_sql(rows),

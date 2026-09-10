@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Compare dtree with YDF's oblique-tree inference implementations."""
+"""Compare apart with YDF's oblique-tree inference implementations."""
 
 import argparse
 import csv
@@ -628,16 +628,16 @@ def duckdb_sql(compiled_case, rows, warmups, runs, seed):
     case = compiled_case.case
     feature_names = [f"x{feature}" for feature in range(case.dimensions)]
     calls = {
-        "dtree_variadic": (
+        "apart_variadic": (
             f"decision_tree(comparison_tree(), {','.join(feature_names)})"
         ),
-        "dtree_array": "decision_tree(comparison_tree(), features)",
+        "apart_array": "decision_tree(comparison_tree(), features)",
     }
     lines = [
         ".mode csv",
         ".headers off",
         ".echo off",
-        "LOAD dtree;",
+        "LOAD apart;",
         "PRAGMA threads=1;",
         "PRAGMA preserve_insertion_order=false;",
         feature_table_sql(rows, compiled_case),
@@ -688,7 +688,7 @@ def run_duckdb(compiled_case, binary, rows, warmups, runs, seed, timeout):
         )
 
     signatures = {}
-    result_counts = {"dtree_variadic": 0, "dtree_array": 0}
+    result_counts = {"apart_variadic": 0, "apart_array": 0}
     result_sums = {method: set() for method in result_counts}
     for record in csv.reader(io.StringIO(process.stdout)):
         if len(record) == 4 and record[0].startswith("verify_"):
@@ -767,7 +767,7 @@ int main(int argc, char **argv) {{
 
 
 def run_standalone(compiled_cases, compiler, rows, warmups, runs, timeout):
-    with tempfile.TemporaryDirectory(prefix="dtree-ydf-") as directory_name:
+    with tempfile.TemporaryDirectory(prefix="apart-ydf-") as directory_name:
         directory = Path(directory_name)
         for compiled in compiled_cases:
             (directory / f"ydf_{compiled.case.name}.h").write_text(
@@ -893,7 +893,7 @@ def compile_cases(cases, calibration_rows, correctness_rows, seed):
 def print_results(compiled_cases, results):
     print(
         "| Case | Shape | Nodes | Leaves | Path depth | Raw C++ | "
-        "YDF standalone | YDF engine | dtree args | dtree ARRAY |"
+        "YDF standalone | YDF engine | apart args | apart ARRAY |"
     )
     print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for compiled in compiled_cases:
@@ -913,18 +913,18 @@ def print_results(compiled_cases, results):
             f"{compiled.case.below_fraction:.2f} | {len(compiled.nodes)} | "
             f"{len(compiled.leaves)} | {path_depth} | {cell('raw_cpp')} | "
             f"{cell('ydf_standalone')} | {cell('ydf_engine')} | "
-            f"{cell('dtree_variadic')} | {cell('dtree_array')} |"
+            f"{cell('apart_variadic')} | {cell('apart_array')} |"
         )
     print("\nTimes are median ± MAD in ns/row.")
     print(
-        "Raw C++ and YDF standalone are kernel-only. YDF engine and dtree "
-        "include their framework overhead; dtree also includes scan and sum."
+        "Raw C++ and YDF standalone are kernel-only. YDF engine and apart "
+        "include their framework overhead; apart also includes scan and sum."
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare dtree with YDF oblique-tree inference"
+        description="Compare apart with YDF oblique-tree inference"
     )
     parser.add_argument("--duckdb", type=Path, required=True)
     parser.add_argument("--compiler", default="c++")

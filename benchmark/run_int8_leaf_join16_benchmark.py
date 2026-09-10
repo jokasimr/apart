@@ -75,7 +75,7 @@ def build_sql(rows, correctness_rows, warmups, runs, seed, payload_count):
         ".mode csv",
         ".headers off",
         ".echo off",
-        "LOAD dtree;",
+        "LOAD apart;",
         "PRAGMA threads=1;",
         "PRAGMA preserve_insertion_order=false;",
         feature_table_sql(rows),
