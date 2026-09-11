@@ -84,14 +84,6 @@ struct ImplicitFixedNode {
 	T threshold;
 };
 
-template <>
-struct alignas(16) ImplicitFixedNode<float, 2> {
-	float coefficients[2];
-	float threshold;
-};
-
-static_assert(sizeof(ImplicitFixedNode<float, 2>) == 16, "FLOAT N=2 implicit nodes must have a 16-byte stride");
-
 template <class T, idx_t N>
 struct FixedTree final : CompiledTree {
 	explicit FixedTree(const ParsedTree &tree) : CompiledTree(tree, N) {
