@@ -161,13 +161,13 @@ END;
 # authored value is equal.
 statement ok
 CREATE MACRO repeated_leaf_tree(v) AS {
-    weights: list_transform(range(1023), i -> [0]),
-    thresholds: list_transform(range(1023), i -> 0),
-    children: list_transform(range(1023), i -> CASE WHEN i < 511
+    weights: list_transform(range(1023), lambda i: [0]),
+    thresholds: list_transform(range(1023), lambda i: 0),
+    children: list_transform(range(1023), lambda i: CASE WHEN i < 511
         THEN [2 * i + 3, 2 * i + 2]
         ELSE [-2 * (i - 511) - 2, -2 * (i - 511) - 1]
     END),
-    values: list_transform(range(1024), i -> v)
+    values: list_transform(range(1024), lambda i: v)
 };
 
 query T

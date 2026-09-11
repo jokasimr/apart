@@ -618,6 +618,7 @@ static void EvaluateImplicitFixedTree(const FixedTree<T, N> &tree, const INPUT &
                                       sel_t *leaf_indices) {
 	auto nodes = tree.implicit_nodes.data();
 	auto node_count = tree.implicit_nodes.size();
+	auto leaves = tree.implicit_leaves.data();
 	idx_t row = 0;
 	for (; row + BLOCK_SIZE <= count; row += BLOCK_SIZE) {
 		uint32_t references[BLOCK_SIZE] {};
@@ -625,7 +626,9 @@ static void EvaluateImplicitFixedTree(const FixedTree<T, N> &tree, const INPUT &
 			AdvanceImplicitFixedBlock(nodes, input, row, references);
 		}
 		for (idx_t lane = 0; lane < BLOCK_SIZE; lane++) {
-			leaf_indices[row + lane] = tree.implicit_leaves[references[lane] - node_count];
+			D_ASSERT(references[lane] >= node_count);
+			D_ASSERT(references[lane] - node_count < tree.implicit_leaves.size());
+			leaf_indices[row + lane] = leaves[references[lane] - node_count];
 		}
 	}
 
@@ -634,7 +637,9 @@ static void EvaluateImplicitFixedTree(const FixedTree<T, N> &tree, const INPUT &
 		for (uint32_t level = 0; level < tree.depth; level++) {
 			reference = AdvanceImplicitFixed(nodes, input, row, reference);
 		}
-		leaf_indices[row] = tree.implicit_leaves[reference - node_count];
+		D_ASSERT(reference >= node_count);
+		D_ASSERT(reference - node_count < tree.implicit_leaves.size());
+		leaf_indices[row] = leaves[reference - node_count];
 	}
 }
 
@@ -735,13 +740,17 @@ static inline void AdvanceGenericBlock(const GenericTree<T> &tree, const INPUT &
 
 template <class T, class INPUT>
 static inline uint32_t TraverseGeneric(const GenericTree<T> &tree, const INPUT &input, idx_t row) {
+	auto nodes = tree.nodes.data();
+	auto node_count = tree.nodes.size();
+	auto coefficients = tree.coefficients.data();
 	auto reference = tree.root;
 	while (!IsLeaf(reference)) {
-		T score = tree.coefficients[reference] * input.Get(0, row);
+		D_ASSERT(reference < node_count);
+		T score = coefficients[reference] * input.Get(0, row);
 		for (idx_t feature = 1; feature < tree.dimensions; feature++) {
-			score += tree.coefficients[feature * tree.nodes.size() + reference] * input.Get(feature, row);
+			score += coefficients[feature * node_count + reference] * input.Get(feature, row);
 		}
-		auto &node = tree.nodes[reference];
+		auto &node = nodes[reference];
 		reference = node.children[static_cast<idx_t>(score >= node.threshold)];
 	}
 	return reference;
