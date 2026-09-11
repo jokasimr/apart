@@ -733,6 +733,22 @@ SELECT decision_tree(
 ----
 <REGEX>:.*unreachable leaf value 3.*
 
+# Deep trees are compiled iteratively during binding.
+query I
+SELECT decision_tree(
+    {
+        weights: list_transform(range(100000), lambda i: [1.0::FLOAT]),
+        thresholds: list_transform(range(100000), lambda i: 0.0::FLOAT),
+        children: list_transform(range(100000), lambda i:
+            CASE WHEN i = 99999 THEN [-1, -1] ELSE [-1, i + 2] END
+        ),
+        values: [42]
+    },
+    1.0::FLOAT
+);
+----
+42
+
 # Untyped NULL leaf values need an explicit result type.
 statement error
 SELECT decision_tree(

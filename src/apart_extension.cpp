@@ -11,7 +11,6 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
-#include <functional>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -46,7 +45,7 @@ struct ParsedTree {
 struct CompiledTree {
 	CompiledTree(const ParsedTree &tree, idx_t dimensions_p)
 	    : leaf_values(tree.leaf_type, tree.leaf_values.size() + 1), leaf_count(tree.leaf_values.size()), root(0),
-	      dimensions(dimensions_p), depth(0), leaf_values_all_valid(false) {
+	      dimensions(dimensions_p), depth(0), min_depth(0), leaf_values_all_valid(false) {
 		for (idx_t leaf_idx = 0; leaf_idx < leaf_count; leaf_idx++) {
 			leaf_values.SetValue(leaf_idx, tree.leaf_values[leaf_idx]);
 		}
@@ -67,6 +66,7 @@ struct CompiledTree {
 	uint32_t root;
 	idx_t dimensions;
 	uint32_t depth;
+	uint32_t min_depth;
 	bool leaf_values_all_valid;
 	vector<bool> struct_children_all_valid;
 };
@@ -344,7 +344,15 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 	vector<uint8_t> node_state(node_count, 0);
 	vector<bool> leaf_used(leaf_count, false);
 	bool found_leaf = false;
-	std::function<uint32_t(int64_t, uint32_t)> visit = [&](int64_t reference, uint32_t depth) -> uint32_t {
+	struct TraversalFrame {
+		uint32_t source;
+		uint32_t target;
+		uint32_t depth;
+		uint8_t next_child;
+	};
+	vector<TraversalFrame> stack;
+
+	auto compile_reference = [&](int64_t reference, uint32_t depth) -> uint32_t {
 		if (reference < 0) {
 			if (reference == std::numeric_limits<int64_t>::min()) {
 				throw BinderException("decision_tree contains an invalid leaf reference");
@@ -357,18 +365,25 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 			leaf_used[leaf] = true;
 			if (!found_leaf) {
 				result.depth = depth;
+				result.min_depth = depth;
 				found_leaf = true;
-			} else if (result.depth != depth) {
-				result.depth = VARIABLE_DEPTH;
+			} else {
+				if (depth < result.min_depth) {
+					result.min_depth = depth;
+				}
+				if (result.depth != depth) {
+					result.depth = VARIABLE_DEPTH;
+				}
 			}
 			return LEAF_MASK | UnsafeNumericCast<uint32_t>(leaf);
 		}
 
-		auto source = UnsafeNumericCast<uint64_t>(reference);
-		if (source >= node_count) {
+		auto source_index = UnsafeNumericCast<uint64_t>(reference);
+		if (source_index >= node_count) {
 			throw BinderException("decision_tree internal-node reference %lld is out of range for %llu nodes",
 			                      reference + 1, node_count);
 		}
+		auto source = UnsafeNumericCast<uint32_t>(source_index);
 		if (node_state[source] == 1) {
 			throw BinderException("decision_tree topology contains a cycle at internal node %lld", reference + 1);
 		}
@@ -381,15 +396,28 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 		auto target = UnsafeNumericCast<uint32_t>(result.nodes.size());
 		result.nodes.emplace_back();
 		initialize_node(result, target, source);
-		auto left = visit(tree.left_children[source], depth + 1);
-		auto right = visit(tree.right_children[source], depth + 1);
-		result.nodes[target].children[0] = left;
-		result.nodes[target].children[1] = right;
-		node_state[source] = 2;
+		stack.push_back({source, target, depth, 0});
 		return target;
 	};
 
-	result.root = visit(0, 0);
+	result.root = compile_reference(0, 0);
+	while (!stack.empty()) {
+		auto &node = stack.back();
+		if (node.next_child == 2) {
+			node_state[node.source] = 2;
+			stack.pop_back();
+			continue;
+		}
+
+		auto source = node.source;
+		auto target = node.target;
+		auto depth = node.depth + 1;
+		auto child = node.next_child++;
+		auto reference = child == 0 ? tree.left_children[source] : tree.right_children[source];
+		auto compiled_child = compile_reference(reference, depth);
+		result.nodes[target].children[child] = compiled_child;
+	}
+
 	for (idx_t node_idx = 0; node_idx < node_count; node_idx++) {
 		if (node_state[node_idx] == 0) {
 			throw BinderException("decision_tree contains unreachable internal node %llu", node_idx + 1);
@@ -406,9 +434,10 @@ template <class T, idx_t N>
 static void MakeImplicitTopology(FixedTree<T, N> &tree) {
 	auto nodes = std::move(tree.nodes);
 	vector<uint32_t> references;
-	references.reserve(nodes.size() * 2 + 1);
+	references.reserve(nodes.size());
 	references.push_back(tree.root);
 	tree.implicit_nodes.reserve(nodes.size());
+	tree.implicit_leaves.reserve(nodes.size() + 1);
 
 	for (idx_t node_idx = 0; node_idx < nodes.size(); node_idx++) {
 		auto reference = references[node_idx];
@@ -420,15 +449,18 @@ static void MakeImplicitTopology(FixedTree<T, N> &tree) {
 			target.coefficients[feature] = source.coefficients[feature];
 		}
 		target.threshold = source.threshold;
-		references.push_back(source.children[0]);
-		references.push_back(source.children[1]);
+		if (IsLeaf(source.children[0])) {
+			D_ASSERT(IsLeaf(source.children[1]));
+			tree.implicit_leaves.push_back(LeafIndex(source.children[0]));
+			tree.implicit_leaves.push_back(LeafIndex(source.children[1]));
+		} else {
+			D_ASSERT(!IsLeaf(source.children[1]));
+			references.push_back(source.children[0]);
+			references.push_back(source.children[1]);
+		}
 	}
-
-	tree.implicit_leaves.reserve(nodes.size() + 1);
-	for (idx_t leaf = nodes.size(); leaf < references.size(); leaf++) {
-		D_ASSERT(IsLeaf(references[leaf]));
-		tree.implicit_leaves.push_back(LeafIndex(references[leaf]));
-	}
+	D_ASSERT(references.size() == nodes.size());
+	D_ASSERT(tree.implicit_leaves.size() == nodes.size() + 1);
 	tree.root = 0;
 }
 
@@ -560,6 +592,36 @@ static inline uint32_t AdvanceImplicitFixed(const ImplicitFixedNode<T, N> *nodes
 	return 2 * reference + 1 + static_cast<uint32_t>(score >= node.threshold);
 }
 
+template <bool TRACK_ACTIVE, idx_t LANE, class T, idx_t N, class INPUT>
+static inline void AdvanceFixedLane(const FixedNode<T, N> *nodes, const INPUT &input, idx_t row,
+                                    uint32_t (&references)[BLOCK_SIZE], uint8_t &next_active) {
+	constexpr auto lane_bit = static_cast<uint8_t>(uint8_t(1) << LANE);
+	auto reference = AdvanceFixed(nodes, input, row + LANE, references[LANE]);
+	references[LANE] = reference;
+	if (TRACK_ACTIVE && !IsLeaf(reference)) {
+		next_active |= lane_bit;
+	}
+}
+
+template <bool TRACK_ACTIVE, class T, idx_t N, class INPUT>
+static inline void AdvanceFixedBlock(const FixedNode<T, N> *nodes, const INPUT &input, idx_t row,
+                                     uint32_t (&references)[BLOCK_SIZE], uint8_t &next_active) {
+	if (!TRACK_ACTIVE) {
+		for (idx_t lane = 0; lane < BLOCK_SIZE; lane++) {
+			references[lane] = AdvanceFixed(nodes, input, row + lane, references[lane]);
+		}
+		return;
+	}
+	AdvanceFixedLane<TRACK_ACTIVE, 0>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 1>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 2>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 3>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 4>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 5>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 6>(nodes, input, row, references, next_active);
+	AdvanceFixedLane<TRACK_ACTIVE, 7>(nodes, input, row, references, next_active);
+}
+
 template <idx_t LANE, class T, idx_t N, class INPUT>
 static inline void AdvanceFixedActiveLane(const FixedNode<T, N> *nodes, const INPUT &input, idx_t row, uint8_t active,
                                           uint32_t (&references)[BLOCK_SIZE], uint8_t &next_active) {
@@ -641,13 +703,16 @@ static void EvaluateFixedTree(const FixedTree<T, N> &tree, const INPUT &input, i
 		EvaluateImplicitFixedTree(tree, input, count, leaf_indices);
 		return;
 	}
-
 	auto nodes = tree.nodes.data();
 	idx_t row = 0;
 	for (; row + BLOCK_SIZE <= count; row += BLOCK_SIZE) {
 		uint32_t references[BLOCK_SIZE] {tree.root, tree.root, tree.root, tree.root,
 		                                 tree.root, tree.root, tree.root, tree.root};
-		uint8_t active = IsLeaf(tree.root) ? 0 : UINT8_C(0xff);
+		uint8_t active = 0;
+		for (uint32_t level = 1; level < tree.min_depth; level++) {
+			AdvanceFixedBlock<false>(nodes, input, row, references, active);
+		}
+		AdvanceFixedBlock<true>(nodes, input, row, references, active);
 		while (active) {
 			uint8_t next_active = 0;
 			AdvanceFixedActive(nodes, input, row, active, references, next_active);
@@ -695,7 +760,7 @@ static inline void UpdateGeneric(const T *coefficients, const INPUT &input, idx_
 	UpdateGenericLane<CHECK_ACTIVE, INITIALIZE, 7>(coefficients, input, feature, row, active, references, scores);
 }
 
-template <bool CHECK_ACTIVE, idx_t LANE, class T>
+template <bool CHECK_ACTIVE, bool TRACK_ACTIVE, idx_t LANE, class T>
 static inline void SelectGenericLane(const GenericNode<T> *nodes, uint8_t active, uint32_t (&references)[BLOCK_SIZE],
                                      const T (&scores)[BLOCK_SIZE], uint8_t &next_active) {
 	constexpr auto lane_bit = static_cast<uint8_t>(uint8_t(1) << LANE);
@@ -703,13 +768,13 @@ static inline void SelectGenericLane(const GenericNode<T> *nodes, uint8_t active
 		auto &node = nodes[references[LANE]];
 		auto reference = node.children[static_cast<idx_t>(scores[LANE] >= node.threshold)];
 		references[LANE] = reference;
-		if (CHECK_ACTIVE && !IsLeaf(reference)) {
+		if (TRACK_ACTIVE && !IsLeaf(reference)) {
 			next_active |= lane_bit;
 		}
 	}
 }
 
-template <bool CHECK_ACTIVE, class T, class INPUT>
+template <bool CHECK_ACTIVE, bool TRACK_ACTIVE, class T, class INPUT>
 static inline void AdvanceGenericBlock(const GenericTree<T> &tree, const INPUT &input, idx_t row, uint8_t active,
                                        uint32_t (&references)[BLOCK_SIZE], uint8_t &next_active) {
 	T scores[BLOCK_SIZE];
@@ -720,14 +785,14 @@ static inline void AdvanceGenericBlock(const GenericTree<T> &tree, const INPUT &
 		UpdateGeneric<CHECK_ACTIVE, false>(coefficients, input, feature, row, active, references, scores);
 	}
 	auto nodes = tree.nodes.data();
-	SelectGenericLane<CHECK_ACTIVE, 0>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 1>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 2>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 3>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 4>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 5>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 6>(nodes, active, references, scores, next_active);
-	SelectGenericLane<CHECK_ACTIVE, 7>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 0>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 1>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 2>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 3>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 4>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 5>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 6>(nodes, active, references, scores, next_active);
+	SelectGenericLane<CHECK_ACTIVE, TRACK_ACTIVE, 7>(nodes, active, references, scores, next_active);
 }
 
 template <class T, class INPUT>
@@ -755,16 +820,20 @@ static void EvaluateGenericTree(const GenericTree<T> &tree, const INPUT &input, 
 		uint32_t references[BLOCK_SIZE] {tree.root, tree.root, tree.root, tree.root,
 		                                 tree.root, tree.root, tree.root, tree.root};
 		if (tree.depth == VARIABLE_DEPTH) {
-			uint8_t active = IsLeaf(tree.root) ? 0 : UINT8_C(0xff);
+			uint8_t active = 0;
+			for (uint32_t level = 1; level < tree.min_depth; level++) {
+				AdvanceGenericBlock<false, false>(tree, input, row, 0, references, active);
+			}
+			AdvanceGenericBlock<false, true>(tree, input, row, 0, references, active);
 			while (active) {
 				uint8_t next_active = 0;
-				AdvanceGenericBlock<true>(tree, input, row, active, references, next_active);
+				AdvanceGenericBlock<true, true>(tree, input, row, active, references, next_active);
 				active = next_active;
 			}
 		} else {
 			for (uint32_t level = 0; level < tree.depth; level++) {
 				uint8_t unused = 0;
-				AdvanceGenericBlock<false>(tree, input, row, 0, references, unused);
+				AdvanceGenericBlock<false, false>(tree, input, row, 0, references, unused);
 			}
 		}
 		for (idx_t lane = 0; lane < BLOCK_SIZE; lane++) {
