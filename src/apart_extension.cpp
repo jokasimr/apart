@@ -220,11 +220,13 @@ static int64_t ReadChildReference(const Value &value, const string &path) {
 	try {
 		reference = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 	} catch (Exception &) {
-		throw BinderException("%s must be within the BIGINT range (-9223372036854775808 to 9223372036854775807); got %s",
-		                      path, value.ToString());
+		throw BinderException(
+		    "%s must be within the BIGINT range (-9223372036854775808 to 9223372036854775807); got %s", path,
+		    value.ToString());
 	}
 	if (reference == 0) {
-		throw BinderException("%s cannot be 0; use 1 for the first node or -1 for the first entry in tree.values", path);
+		throw BinderException("%s cannot be 0; use 1 for the first node or -1 for the first entry in tree.values",
+		                      path);
 	}
 	return reference > 0 ? reference - 1 : reference;
 }
@@ -244,8 +246,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	auto children_idx = RequireStructField(fields, "children", "tree");
 	auto values_idx = RequireStructField(fields, "values", "tree");
 	if (fields.size() != 4) {
-		throw BinderException(
-		    "tree must contain exactly the fields 'weights', 'thresholds', 'children', and 'values'");
+		throw BinderException("tree must contain exactly the fields 'weights', 'thresholds', 'children', and 'values'");
 	}
 
 	auto &fields_values = StructValue::GetChildren(tree_value);
@@ -1495,8 +1496,9 @@ static LogicalType ConfigureTypes(ClientContext &context, ScalarFunction &functi
 		auto &feature_type = feature_types[feature_idx];
 		if (CastFunctionSet::ImplicitCastCost(context, feature_type, computation_type) < 0) {
 			auto description = array_input ? "feature array elements" : "argument " + to_string(feature_idx + 2);
-			throw BinderException("decision_tree %s of type %s cannot be implicitly converted to %s; use an explicit cast",
-			                      description, feature_type.ToString(), computation_type.ToString());
+			throw BinderException(
+			    "decision_tree %s of type %s cannot be implicitly converted to %s; use an explicit cast", description,
+			    feature_type.ToString(), computation_type.ToString());
 		}
 	}
 
@@ -1540,9 +1542,10 @@ static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarF
 	auto tree_value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
 	auto parsed_tree = ParseTreeValue(tree_value);
 	if (arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::LIST) {
-		throw BinderException("decision_tree feature input has type %s, a variable-length list. "
-		                      "Use a fixed-size array, e.g. ::DOUBLE[%llu], or pass each feature as a separate argument",
-		                      arguments[1]->return_type.ToString(), parsed_tree.coefficients[0].size());
+		throw BinderException(
+		    "decision_tree feature input has type %s, a variable-length list. "
+		    "Use a fixed-size array, e.g. ::DOUBLE[%llu], or pass each feature as a separate argument",
+		    arguments[1]->return_type.ToString(), parsed_tree.coefficients[0].size());
 	}
 	bool array_input = arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::ARRAY;
 	idx_t dimensions;
