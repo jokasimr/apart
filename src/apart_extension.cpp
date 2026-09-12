@@ -8,6 +8,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -40,7 +41,6 @@ struct ParsedTree {
 	vector<int64_t> left_children;
 	vector<int64_t> right_children;
 	vector<Value> leaf_values;
-	LogicalType parameter_type;
 	LogicalType leaf_type;
 };
 
@@ -186,31 +186,19 @@ static idx_t RequireStructField(const child_list_t<LogicalType> &fields, const s
 	return result.GetIndex();
 }
 
-static void RequireFloatingType(const LogicalType &type, const string &description) {
+static void RequireNumericFeatureType(const LogicalType &type, const string &description) {
 	if (type.id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
 	}
-	if (type != LogicalType::FLOAT && type != LogicalType::DOUBLE) {
-		throw BinderException("decision_tree %s must be FLOAT or DOUBLE; got %s. "
-		                      "For numeric inputs, use ::FLOAT or ::DOUBLE",
-		                      description, type.ToString());
+	if (!type.IsNumeric()) {
+		throw BinderException("decision_tree %s must be numeric; got %s", description, type.ToString());
 	}
 }
 
-static void IncludeCommonType(LogicalType &current, const LogicalType &type, const string &path) {
-	LogicalType combined;
-	if (!LogicalType::TryGetMaxLogicalTypeUnchecked(current, type, combined)) {
-		throw BinderException("%s has type %s, which cannot be combined with the other weights and thresholds (%s)",
-		                      path, type.ToString(), current.ToString());
-	}
-	current = std::move(combined);
-}
-
-static void IncludeParameterType(LogicalType &current, const LogicalType &type, const string &path) {
+static void RequireNumericParameterType(const LogicalType &type, const string &path) {
 	if (!type.IsNumeric()) {
 		throw BinderException("%s must be a number; got %s", path, type.ToString());
 	}
-	IncludeCommonType(current, type, path);
 }
 
 static int64_t ReadChildReference(const Value &value, const string &path) {
@@ -287,7 +275,6 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	}
 
 	ParsedTree result;
-	result.parameter_type = LogicalType::SQLNULL;
 	result.leaf_type = leaf_values[0].type();
 	if (result.leaf_type.id() == LogicalTypeId::SQLNULL || result.leaf_type.id() == LogicalTypeId::UNKNOWN) {
 		throw BinderException(
@@ -312,7 +299,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 			if (weight_values[weight].IsNull()) {
 				throw BinderException("%s cannot be NULL", weight_path);
 			}
-			IncludeParameterType(result.parameter_type, weight_values[weight].type(), weight_path);
+			RequireNumericParameterType(weight_values[weight].type(), weight_path);
 			weights.push_back(weight_values[weight]);
 		}
 		result.coefficients.push_back(std::move(weights));
@@ -322,7 +309,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 		if (threshold.IsNull()) {
 			throw BinderException("%s cannot be NULL", threshold_path);
 		}
-		IncludeParameterType(result.parameter_type, threshold.type(), threshold_path);
+		RequireNumericParameterType(threshold.type(), threshold_path);
 		result.thresholds.push_back(threshold);
 
 		auto child_path = "tree.children[" + to_string(node + 1) + "]";
@@ -1489,22 +1476,29 @@ static void ConfigureFunction(ScalarFunction &function, idx_t dimensions, bool a
 	}
 }
 
-static LogicalType ConfigureTypes(ScalarFunction &function, const ParsedTree &tree, idx_t dimensions, bool array_input,
-                                  const vector<LogicalType> &feature_types) {
-	auto computation_type = tree.parameter_type;
+static LogicalType ConfigureTypes(ClientContext &context, ScalarFunction &function, const ParsedTree &tree,
+                                  idx_t dimensions, bool array_input, const vector<LogicalType> &feature_types) {
+	// Validation guarantees nonempty fields; LIST/ARRAY element types are uniform.
+	auto weight_type = tree.coefficients[0][0].type().id();
+	auto threshold_type = tree.thresholds[0].type().id();
+	bool has_float = weight_type == LogicalTypeId::FLOAT || threshold_type == LogicalTypeId::FLOAT;
+	bool has_double = weight_type == LogicalTypeId::DOUBLE || threshold_type == LogicalTypeId::DOUBLE;
 	for (idx_t feature_idx = 0; feature_idx < feature_types.size(); feature_idx++) {
 		auto &feature_type = feature_types[feature_idx];
 		auto description = array_input ? "feature array elements" : "argument " + to_string(feature_idx + 2);
-		RequireFloatingType(feature_type, description);
-		LogicalType combined;
-		if (!LogicalType::TryGetMaxLogicalTypeUnchecked(computation_type, feature_type, combined)) {
-			throw BinderException("decision_tree cannot combine weights and thresholds of type %s with feature values "
-			                      "of type %s; cast them to a common FLOAT or DOUBLE type",
-			                      computation_type.ToString(), feature_type.ToString());
-		}
-		computation_type = std::move(combined);
+		RequireNumericFeatureType(feature_type, description);
+		has_float |= feature_type.id() == LogicalTypeId::FLOAT;
+		has_double |= feature_type.id() == LogicalTypeId::DOUBLE;
 	}
-	D_ASSERT(computation_type == LogicalType::FLOAT || computation_type == LogicalType::DOUBLE);
+	LogicalType computation_type = has_float && !has_double ? LogicalType::FLOAT : LogicalType::DOUBLE;
+	for (idx_t feature_idx = 0; feature_idx < feature_types.size(); feature_idx++) {
+		auto &feature_type = feature_types[feature_idx];
+		if (CastFunctionSet::ImplicitCastCost(context, feature_type, computation_type) < 0) {
+			auto description = array_input ? "feature array elements" : "argument " + to_string(feature_idx + 2);
+			throw BinderException("decision_tree %s of type %s cannot be implicitly converted to %s; use an explicit cast",
+			                      description, feature_type.ToString(), computation_type.ToString());
+		}
+	}
 
 	function.return_type = tree.leaf_type;
 	function.varargs = LogicalType(LogicalTypeId::INVALID);
@@ -1569,7 +1563,7 @@ static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarF
 	function.arguments.resize(arguments.size());
 	function.arguments[0] = arguments[0]->return_type;
 	Function::EraseArgument(function, arguments, 0);
-	auto computation_type = ConfigureTypes(function, parsed_tree, dimensions, array_input, feature_types);
+	auto computation_type = ConfigureTypes(context, function, parsed_tree, dimensions, array_input, feature_types);
 	auto compiled_tree = computation_type == LogicalType::DOUBLE ? CompileTree<double>(parsed_tree, dimensions)
 	                                                             : CompileTree<float>(parsed_tree, dimensions);
 	return make_uniq<DecisionTreeBindData>(std::move(compiled_tree), std::move(tree_value), computation_type);
@@ -1595,7 +1589,8 @@ static unique_ptr<FunctionData> DeserializeDecisionTree(Deserializer &deserializ
 	}
 	ValidateDimensions(parsed_tree, dimensions,
 	                   array_input ? "the feature array length" : "the number of feature arguments");
-	auto computation_type = ConfigureTypes(function, parsed_tree, dimensions, array_input, feature_types);
+	auto computation_type = ConfigureTypes(deserializer.Get<ClientContext &>(), function, parsed_tree, dimensions,
+	                                       array_input, feature_types);
 	auto compiled_tree = computation_type == LogicalType::DOUBLE ? CompileTree<double>(parsed_tree, dimensions)
 	                                                             : CompileTree<float>(parsed_tree, dimensions);
 	return make_uniq<DecisionTreeBindData>(std::move(compiled_tree), std::move(tree_value), computation_type);

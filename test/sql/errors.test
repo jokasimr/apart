@@ -228,15 +228,21 @@ SELECT decision_tree(two_feature_error_test_tree(), [1]::DOUBLE[1]);
 ----
 tree.weights[1] has the wrong number of weights; expected 1 to match the feature array length, got 2
 
+# Non-numeric features are rejected even when an explicit numeric cast exists.
 statement error
-SELECT decision_tree(two_feature_error_test_tree(), 1.0::FLOAT, 2);
+SELECT decision_tree(two_feature_error_test_tree(), 1.0::FLOAT, true);
 ----
-decision_tree argument 3 must be FLOAT or DOUBLE; got INTEGER. For numeric inputs, use ::FLOAT or ::DOUBLE
+decision_tree argument 3 must be numeric; got BOOLEAN
 
 statement error
-SELECT decision_tree(two_feature_error_test_tree(), [1, 2]::INTEGER[2]);
+SELECT decision_tree(two_feature_error_test_tree(), ['1', '2']::VARCHAR[2]);
 ----
-decision_tree feature array elements must be FLOAT or DOUBLE; got INTEGER. For numeric inputs, use ::FLOAT or ::DOUBLE
+decision_tree feature array elements must be numeric; got VARCHAR
+
+statement error
+SELECT decision_tree(error_test_tree(), '1'::VARCHAR);
+----
+decision_tree argument 2 must be numeric; got VARCHAR
 
 # Unresolved feature parameters still bind at EXECUTE. A rejected list must not
 # prevent subsequent executions with supported scalar types.

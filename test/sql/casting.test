@@ -1,0 +1,246 @@
+# name: test/sql/casting.test
+# description: numeric feature inputs and computation precision
+# group: [sql]
+
+require apart
+
+statement ok
+PRAGMA verify_serializer;
+
+statement ok
+CREATE MACRO casting_tree(w, t) AS {
+    weights: [w], thresholds: [t], children: [[-2, -1]], values: ['below', 'above']
+};
+
+# Every supported integer type and DECIMAL storage width accepts scalar and array inputs.
+foreach feature_type TINYINT SMALLINT INTEGER BIGINT HUGEINT UTINYINT USMALLINT UINTEGER UBIGINT UHUGEINT DECIMAL(4,1) DECIMAL(9,2) DECIMAL(18,3) DECIMAL(38,4)
+
+query TT
+SELECT decision_tree(casting_tree([1], 1), x),
+       decision_tree(casting_tree([1], 1), [x]::${feature_type}[1])
+FROM (VALUES (0::${feature_type}), (1::${feature_type})) inputs(x);
+----
+below	below
+above	above
+
+endloop
+
+# Decimal fractions are preserved, including equality at the threshold.
+query TT
+SELECT decision_tree(casting_tree([2], 0.5), x),
+       decision_tree(casting_tree([2], 0.5), [x]::DECIMAL(9,2)[1])
+FROM (VALUES (0.24::DECIMAL(9,2)), (0.25::DECIMAL(9,2)), (0.26::DECIMAL(9,2))) inputs(x);
+----
+below	below
+above	above
+above	above
+
+# Without FLOAT or DOUBLE inputs, computation uses DOUBLE.
+# 16777217 is exact in DOUBLE but rounds down to 16777216 in FLOAT.
+foreach number_type INTEGER DECIMAL(18,1) HUGEINT UHUGEINT
+
+query TT
+SELECT decision_tree(casting_tree([1::${number_type}], 16777217::${number_type}), x),
+       decision_tree(casting_tree([1::${number_type}], 16777217::${number_type}), [x]::${number_type}[1])
+FROM (VALUES (16777216::${number_type})) inputs(x);
+----
+below	below
+
+endloop
+
+# Mixed integer/decimal types and ordinary numeric literals follow the same rule.
+query TTT
+SELECT decision_tree(casting_tree([1], 16777217.0), 16777216),
+       decision_tree(casting_tree([1.0], 16777217), 16777216.0),
+       decision_tree(casting_tree([1::HUGEINT], 16777217::UHUGEINT), 16777216);
+----
+below	below	below
+
+# A FLOAT weight, threshold, or feature selects FLOAT if no input is DOUBLE.
+# For the threshold-only case, FLOAT rounds the feature 16777219 up to 16777220;
+# DOUBLE would leave the feature below the threshold.
+foreach number_type INTEGER DECIMAL(18,1) HUGEINT UHUGEINT
+
+query TTT
+SELECT decision_tree(casting_tree([1::FLOAT], 16777217::${number_type}), lo),
+       decision_tree(casting_tree([1::${number_type}], 16777220::FLOAT), hi),
+       decision_tree(casting_tree([1::${number_type}], 16777217::${number_type}), lo::FLOAT)
+FROM (VALUES (16777216::${number_type}, 16777219::${number_type})) inputs(lo, hi);
+----
+above	above	above
+
+endloop
+
+# A DOUBLE weight, threshold, or feature overrides FLOAT.
+query TTT
+SELECT decision_tree(casting_tree([1::DOUBLE], 16777220::FLOAT), hi),
+       decision_tree(casting_tree([1::FLOAT], 16777217::DOUBLE), lo),
+       decision_tree(casting_tree([1::FLOAT], 16777217), lo::DOUBLE)
+FROM (VALUES (16777216, 16777219)) inputs(lo, hi);
+----
+below	below	below
+
+# Input order does not affect precision. Permute features together with their weights.
+query TTTTTT
+SELECT decision_tree(casting_tree([1, 0, 0], 16777217), h, u, f),
+       decision_tree(casting_tree([1, 0, 0], 16777217), h, f, u),
+       decision_tree(casting_tree([0, 1, 0], 16777217), u, h, f),
+       decision_tree(casting_tree([0, 0, 1], 16777217), u, f, h),
+       decision_tree(casting_tree([0, 1, 0], 16777217), f, h, u),
+       decision_tree(casting_tree([0, 0, 1], 16777217), f, u, h)
+FROM (VALUES (16777216::HUGEINT, 0::UHUGEINT, 0::FLOAT)) inputs(h, u, f);
+----
+above	above	above	above	above	above
+
+query TTT
+SELECT decision_tree(casting_tree([0, 1, 0], 16777217), d, h, f),
+       decision_tree(casting_tree([1, 0, 0], 16777217), h, d, f),
+       decision_tree(casting_tree([1, 0, 0], 16777217), h, f, d)
+FROM (VALUES (16777216::HUGEINT, 0::DOUBLE, 0::FLOAT)) inputs(h, d, f);
+----
+below	below	below
+
+# Scalar evaluators with more than seven features use the same precision policy.
+query TTT
+SELECT decision_tree(casting_tree([1, 0, 0, 0, 0, 0, 0, 0], 16777217), h, u, 0, 0, 0, 0, 0, 0),
+       decision_tree(casting_tree([1, 0, 0, 0, 0, 0, 0, 0], 16777217), h, u, f, 0, 0, 0, 0, 0),
+       decision_tree(casting_tree([1, 0, 0, 0, 0, 0, 0, 0], 16777217), h, u, f, 0::DOUBLE, 0, 0, 0, 0)
+FROM (VALUES (16777216::HUGEINT, 0::UHUGEINT, 0::FLOAT)) inputs(h, u, f);
+----
+below	above	below
+
+# Array element types follow the same policy for both evaluator sizes.
+foreach dimensions 1 8
+
+query TTT
+SELECT decision_tree(casting_tree(list_resize([1::HUGEINT], ${dimensions}, 0::HUGEINT), 16777217::UHUGEINT), x::INTEGER[${dimensions}]),
+       decision_tree(casting_tree(list_resize([1::HUGEINT], ${dimensions}, 0::HUGEINT), 16777217::UHUGEINT), x::FLOAT[${dimensions}]),
+       decision_tree(casting_tree(list_resize([1::HUGEINT], ${dimensions}, 0::HUGEINT), 16777217::UHUGEINT), x::DOUBLE[${dimensions}])
+FROM (SELECT list_resize([16777216], ${dimensions}, 0) AS x) inputs;
+----
+below	above	below
+
+endloop
+
+# DuckDB gives all weights one element type, and all thresholds one element type,
+# including when floating-point literals occur only in later nodes.
+statement ok
+CREATE MACRO typed_parameter_tree(w, t) AS {
+    weights: w, thresholds: t, children: [[2, -1], [-2, -1]], values: ['below', 'above']
+};
+
+foreach sequence list_value array_value
+
+query TT
+SELECT decision_tree(typed_parameter_tree(
+           ${sequence}(${sequence}(1), ${sequence}(1::DOUBLE)),
+           ${sequence}(16777217, 0)), 16777216::FLOAT),
+       decision_tree(fixed_depth(typed_parameter_tree(
+           ${sequence}(${sequence}(1), ${sequence}(1)),
+           ${sequence}(16777220, 0::FLOAT))), 16777219::HUGEINT);
+----
+below	above
+
+endloop
+
+# Leaf types determine the result type, independently of computation precision.
+foreach leaf_type FLOAT DOUBLE DECIMAL(9,2)
+
+query IIII
+SELECT float_features = 1.5, integer_features = 0,
+       typeof(float_features) = '${leaf_type}', typeof(integer_features) = '${leaf_type}'
+FROM (
+    SELECT decision_tree({
+               weights: [[1]], thresholds: [16777217], children: [[-2, -1]],
+               values: [0::${leaf_type}, 1.5::${leaf_type}]
+           }, 16777216::FLOAT) AS float_features,
+           decision_tree({
+               weights: [[1]], thresholds: [16777217], children: [[-2, -1]],
+               values: [0::${leaf_type}, 1.5::${leaf_type}]
+           }, 16777216) AS integer_features
+) results;
+----
+1	1	1	1
+
+endloop
+
+# Runtime casts preserve values and NULLs across chunks, including NULL features
+# with zero weights. Exercise scalar/array inputs and both evaluator sizes.
+foreach computation_type FLOAT DOUBLE
+
+query I
+WITH inputs AS (
+    SELECT CASE WHEN i % 67 = 0 THEN NULL ELSE (i % 3 - 1)::INTEGER END AS x,
+           CASE WHEN i % 71 = 0 THEN NULL ELSE 0::DECIMAL(9,2) END AS y
+    FROM range(4097) rows(i)
+), expected AS (
+    SELECT *, CASE WHEN x IS NULL OR y IS NULL THEN NULL
+                   WHEN x < 0 THEN 'below' ELSE 'above' END AS result
+    FROM inputs
+)
+SELECT count(*)
+FROM expected
+WHERE decision_tree(casting_tree([1, 0]::${computation_type}[], 0), x, y) IS DISTINCT FROM result
+   OR decision_tree(casting_tree([1, 0]::${computation_type}[], 0), [x, y]::DECIMAL(18,2)[2]) IS DISTINCT FROM result
+   OR decision_tree(casting_tree([1, 0, 0, 0, 0, 0, 0, 0]::${computation_type}[], 0), x, y, 0, 0, 0, 0, 0, 0) IS DISTINCT FROM result
+   OR decision_tree(casting_tree([1, 0, 0, 0, 0, 0, 0, 0]::${computation_type}[], 0), [x, y, 0, 0, 0, 0, 0, 0]::DECIMAL(18,2)[8]) IS DISTINCT FROM result;
+----
+0
+
+endloop
+
+# Constant NULL inputs still acquire the leaf result type during binding.
+query TTTT
+SELECT decision_tree(casting_tree([1], 0), NULL::INTEGER[1]),
+       typeof(decision_tree(casting_tree([1], 0), NULL::INTEGER[1])),
+       decision_tree(casting_tree([1], 0), NULL::DECIMAL(9,2)),
+       typeof(decision_tree(casting_tree([1], 0), NULL::DECIMAL(9,2)));
+----
+NULL	VARCHAR	NULL	VARCHAR
+
+# Prepared calls rebind when the feature type or scalar/array input form changes.
+statement ok
+PREPARE numeric_feature AS SELECT decision_tree(casting_tree([1], 16777217), $1);
+
+query T
+EXECUTE numeric_feature(16777216::FLOAT);
+----
+above
+
+foreach feature 16777216::INTEGER 16777216::DECIMAL(18,1) [16777216]::INTEGER[1] 16777216::DOUBLE
+
+query T
+EXECUTE numeric_feature(${feature});
+----
+below
+
+endloop
+
+query T
+EXECUTE numeric_feature([16777216]::FLOAT[1]);
+----
+above
+
+query T
+EXECUTE numeric_feature(NULL::INTEGER);
+----
+NULL
+
+# Replacing the prepared tree also recomputes precision from its parameter types.
+statement ok
+PREPARE numeric_tree AS SELECT decision_tree($1, 16777216);
+
+query T
+EXECUTE numeric_tree(casting_tree([1::FLOAT], 16777217));
+----
+above
+
+query T
+EXECUTE numeric_tree(casting_tree([1::DOUBLE], 16777217));
+----
+below
+
+query T
+EXECUTE numeric_tree(casting_tree([1], 16777217));
+----
+below

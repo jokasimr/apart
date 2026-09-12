@@ -11,7 +11,7 @@ decision_tree(tree, x1, x2, ..., xn) -> T
 decision_tree(tree, features)         -> T
 ```
 
-The first form accepts one or more feature arguments. The second accepts a fixed-size DuckDB `ARRAY`. Feature values must be `FLOAT` or `DOUBLE`.
+The first form accepts one or more feature arguments. The second accepts a fixed-size DuckDB `ARRAY`. Feature values may be integers, decimals, `FLOAT`, or `DOUBLE`.
 
 The tree must be constant for the query. Its leaf values must have one common type, which becomes the return type `T` of the function. Leaf values may use any DuckDB type, including `STRUCT`, `LIST`, and `ARRAY`.
 
@@ -81,7 +81,7 @@ SELECT decision_tree(example_tree(), [x, y]::FLOAT[2]) AS result
 FROM measurements;
 ```
 
-Weights and thresholds may use any numeric type and are converted to the feature computation type. Integer features must be cast to `FLOAT` or `DOUBLE`. If any feature is `NULL`, the result is `NULL`.
+The computation type is selected from all weights, thresholds, and features: if any is `DOUBLE`, use `DOUBLE`; otherwise, if any is `FLOAT`, use `FLOAT`; otherwise, use `DOUBLE`. Feature conversions follow DuckDB's implicit casting rules. These conversions can lose precision. If any feature is `NULL`, the result is `NULL`.
 
 
 ## Fixed depth (optional optimization)

@@ -728,39 +728,6 @@ SELECT decision_tree(
 ----
 <REGEX>:.*tree is missing required field 'values'.*
 
-# FLOAT and DOUBLE parameters/features are promoted to DOUBLE when mixed.
-query IT
-SELECT decision_tree(
-    one_node_tree([1.0::DOUBLE], 0, 0::BIGINT, 1::BIGINT),
-    1.0::FLOAT
-), typeof(decision_tree(
-    one_node_tree([1], 0.0::DOUBLE, 'left', 'right'),
-    1.0::DOUBLE
-));
-----
-1	VARCHAR
-
-# Ordinary numeric literals in the tree are converted to the feature computation type.
-query TT
-SELECT decision_tree(
-    one_node_tree([1], 0.5, 0, 1.5),
-    1.0::FLOAT
-), typeof(decision_tree(
-    one_node_tree([1], 0, 0, 1.5),
-    1.0::FLOAT
-));
-----
-1.5	DECIMAL(11,1)
-
-# Feature columns remain restricted to FLOAT and DOUBLE.
-statement error
-SELECT decision_tree(
-    one_node_tree([1], 0, 0, 1),
-    1
-);
-----
-<REGEX>:.*decision_tree argument 2 must be FLOAT or DOUBLE; got INTEGER.*::FLOAT or ::DOUBLE.*
-
 # The four fields are exact, and errors identify the indexed authored location.
 statement error
 SELECT decision_tree(
