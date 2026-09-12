@@ -9,6 +9,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include <limits>
@@ -23,6 +24,7 @@ constexpr uint32_t LEAF_MASK = uint32_t(1) << 31;
 constexpr uint32_t INDEX_MASK = LEAF_MASK - 1;
 constexpr uint32_t VARIABLE_DEPTH = std::numeric_limits<uint32_t>::max();
 constexpr idx_t BLOCK_SIZE = 8;
+constexpr uint64_t MAX_PADDED_NODE_COUNT = 1'000'000;
 
 static inline bool IsLeaf(uint32_t reference) {
 	return (reference & LEAF_MASK) != 0;
@@ -126,6 +128,22 @@ struct DecisionTreeBindData final : FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DecisionTreeBindData>();
 		return computation_type == other.computation_type && tree_value == other.tree_value;
+	}
+};
+
+struct FixedDepthTreeBindData final : FunctionData {
+	explicit FixedDepthTreeBindData(Value tree_value_p) : tree_value(std::move(tree_value_p)) {
+	}
+
+	Value tree_value;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<FixedDepthTreeBindData>(tree_value);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<FixedDepthTreeBindData>();
+		return tree_value == other.tree_value;
 	}
 };
 
@@ -336,7 +354,7 @@ static T ReadNumber(const Value &value, const string &path) {
 }
 
 template <class TREE, class INITIALIZE_NODE>
-static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NODE &&initialize_node) {
+static uint32_t CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NODE &&initialize_node) {
 	auto node_count = tree.coefficients.size();
 	auto leaf_count = tree.leaf_values.size();
 	result.nodes.reserve(node_count);
@@ -344,6 +362,7 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 	vector<uint8_t> node_state(node_count, 0);
 	vector<bool> leaf_used(leaf_count, false);
 	bool found_leaf = false;
+	uint32_t max_depth = 0;
 	struct TraversalFrame {
 		uint32_t source;
 		uint32_t target;
@@ -363,6 +382,7 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 				                      reference, leaf_count);
 			}
 			leaf_used[leaf] = true;
+			max_depth = MaxValue(max_depth, depth);
 			if (!found_leaf) {
 				result.depth = depth;
 				result.min_depth = depth;
@@ -428,6 +448,149 @@ static void CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE_NOD
 			throw BinderException("decision_tree contains unreachable leaf value %llu", leaf_idx + 1);
 		}
 	}
+	return max_depth;
+}
+
+struct ParsedTopologyNode {
+	uint32_t children[2];
+	uint32_t source;
+};
+
+struct ParsedTopology {
+	vector<ParsedTopologyNode> nodes;
+	uint32_t root = 0;
+	uint32_t depth = 0;
+	uint32_t min_depth = 0;
+};
+
+static Value SequenceValue(const Value &prototype, const LogicalType &child_type, vector<Value> values) {
+	switch (prototype.type().id()) {
+	case LogicalTypeId::LIST:
+		return Value::LIST(child_type, std::move(values));
+	case LogicalTypeId::ARRAY:
+		return Value::ARRAY(child_type, std::move(values));
+	default:
+		throw InternalException("Expected a LIST or ARRAY while constructing a fixed-depth tree");
+	}
+}
+
+static Value SequenceValueLike(const Value &prototype, vector<Value> values) {
+	auto child_type = prototype.type().id() == LogicalTypeId::LIST ? ListType::GetChildType(prototype.type())
+	                                                               : ArrayType::GetChildType(prototype.type());
+	return SequenceValue(prototype, child_type, std::move(values));
+}
+
+static Value ChildPairValue(const Value &prototype, int64_t above, int64_t below) {
+	vector<Value> children {Value::BIGINT(above), Value::BIGINT(below)};
+	return SequenceValue(prototype, LogicalType::BIGINT, std::move(children));
+}
+
+static void PlacePaddedTopology(const ParsedTopology &tree, uint32_t reference, idx_t position, uint32_t depth,
+                                uint32_t max_depth, vector<uint32_t> &node_sources, vector<sel_t> &leaf_indices) {
+	if (depth == max_depth) {
+		D_ASSERT(IsLeaf(reference));
+		D_ASSERT(position >= node_sources.size());
+		auto leaf_position = position - node_sources.size();
+		D_ASSERT(leaf_position < leaf_indices.size());
+		leaf_indices[leaf_position] = LeafIndex(reference);
+		return;
+	}
+
+	D_ASSERT(position < node_sources.size());
+	if (IsLeaf(reference)) {
+		// The predicate is irrelevant because either branch ultimately reaches the same leaf.
+		node_sources[position] = 0;
+		PlacePaddedTopology(tree, reference, position * 2 + 1, depth + 1, max_depth, node_sources, leaf_indices);
+		PlacePaddedTopology(tree, reference, position * 2 + 2, depth + 1, max_depth, node_sources, leaf_indices);
+		return;
+	}
+
+	auto &node = tree.nodes[reference];
+	node_sources[position] = node.source;
+	// Tree values store [above, below], while compiled topology stores [below, above].
+	PlacePaddedTopology(tree, node.children[1], position * 2 + 1, depth + 1, max_depth, node_sources, leaf_indices);
+	PlacePaddedTopology(tree, node.children[0], position * 2 + 2, depth + 1, max_depth, node_sources, leaf_indices);
+}
+
+static Value MakeFixedDepthTreeValue(const Value &tree_value) {
+	auto parsed_tree = ParseTreeValue(tree_value);
+	auto dimensions = parsed_tree.coefficients[0].size();
+	ValidateDimensions(parsed_tree, dimensions);
+
+	ParsedTopology topology;
+	auto maximum_depth =
+	    CompileTopology(parsed_tree, topology, [&](ParsedTopology &target_tree, uint32_t target, idx_t source) {
+		    target_tree.nodes[target].source = UnsafeNumericCast<uint32_t>(source);
+	    });
+	if (topology.depth != VARIABLE_DEPTH) {
+		return tree_value;
+	}
+
+	D_ASSERT(maximum_depth > 0);
+	if (maximum_depth >= std::numeric_limits<uint64_t>::digits) {
+		throw BinderException("fixed_depth cannot represent a fully padded tree of depth %u", maximum_depth);
+	}
+	auto padded_leaf_count = uint64_t(1) << maximum_depth;
+	auto padded_node_count = padded_leaf_count - 1;
+	if (padded_node_count >= LEAF_MASK) {
+		throw BinderException("fixed_depth supports fewer than %u padded internal nodes", LEAF_MASK);
+	}
+	if (padded_node_count > MAX_PADDED_NODE_COUNT) {
+		throw BinderException("fixed_depth would create %llu internal nodes, exceeding the limit of %llu",
+		                      padded_node_count, MAX_PADDED_NODE_COUNT);
+	}
+
+	vector<uint32_t> node_sources(UnsafeNumericCast<idx_t>(padded_node_count));
+	vector<sel_t> leaf_indices(UnsafeNumericCast<idx_t>(padded_leaf_count));
+	PlacePaddedTopology(topology, topology.root, 0, 0, maximum_depth, node_sources, leaf_indices);
+
+	auto &fields = StructType::GetChildTypes(tree_value.type());
+	auto weights_idx = RequireStructField(fields, "weights", "tree");
+	auto thresholds_idx = RequireStructField(fields, "thresholds", "tree");
+	auto children_idx = RequireStructField(fields, "children", "tree");
+	auto &field_values = StructValue::GetChildren(tree_value);
+	auto &weight_rows = SequenceValues(field_values[weights_idx], "tree.weights");
+	auto &threshold_values = SequenceValues(field_values[thresholds_idx], "tree.thresholds");
+	auto &child_rows = SequenceValues(field_values[children_idx], "tree.children");
+
+	vector<Value> padded_weights;
+	vector<Value> padded_thresholds;
+	vector<Value> padded_children;
+	padded_weights.reserve(node_sources.size());
+	padded_thresholds.reserve(node_sources.size());
+	padded_children.reserve(node_sources.size());
+	auto first_leaf_parent = UnsafeNumericCast<idx_t>(padded_leaf_count / 2 - 1);
+	for (idx_t node_idx = 0; node_idx < node_sources.size(); node_idx++) {
+		auto source = node_sources[node_idx];
+		padded_weights.push_back(weight_rows[source]);
+		padded_thresholds.push_back(threshold_values[source]);
+		if (node_idx < first_leaf_parent) {
+			padded_children.push_back(ChildPairValue(child_rows[0], UnsafeNumericCast<int64_t>(node_idx * 2 + 2),
+			                                         UnsafeNumericCast<int64_t>(node_idx * 2 + 3)));
+			continue;
+		}
+		auto leaf_offset = 2 * (node_idx - first_leaf_parent);
+		auto above = -UnsafeNumericCast<int64_t>(leaf_indices[leaf_offset]) - 1;
+		auto below = -UnsafeNumericCast<int64_t>(leaf_indices[leaf_offset + 1]) - 1;
+		padded_children.push_back(ChildPairValue(child_rows[0], above, below));
+	}
+
+	auto weights = SequenceValueLike(field_values[weights_idx], std::move(padded_weights));
+	auto thresholds = SequenceValueLike(field_values[thresholds_idx], std::move(padded_thresholds));
+	auto child_type = padded_children[0].type();
+	auto children = SequenceValue(field_values[children_idx], child_type, std::move(padded_children));
+	// Value copies share nested storage, including the original leaf-value sequence.
+	vector<Value> result_values(field_values.begin(), field_values.end());
+	result_values[weights_idx] = std::move(weights);
+	result_values[thresholds_idx] = std::move(thresholds);
+	result_values[children_idx] = std::move(children);
+
+	child_list_t<Value> result;
+	result.reserve(fields.size());
+	for (idx_t field_idx = 0; field_idx < fields.size(); field_idx++) {
+		result.emplace_back(fields[field_idx].first, std::move(result_values[field_idx]));
+	}
+	return Value::STRUCT(std::move(result));
 }
 
 template <class T, idx_t N>
@@ -1415,8 +1578,38 @@ static unique_ptr<FunctionData> DeserializeDecisionTree(Deserializer &deserializ
 	return make_uniq<DecisionTreeBindData>(std::move(compiled_tree), std::move(tree_value), computation_type);
 }
 
+static unique_ptr<FunctionData> BindFixedDepthTree(ClientContext &context, ScalarFunction &function,
+                                                   vector<unique_ptr<Expression>> &arguments) {
+	D_ASSERT(arguments.size() == 1);
+	if (arguments[0]->HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	if (!arguments[0]->IsFoldable()) {
+		throw BinderException("fixed_depth tree argument must be constant for a bound invocation");
+	}
+	if (arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
+		throw BinderException("fixed_depth argument must be a constant STRUCT, not %s",
+		                      arguments[0]->return_type.ToString());
+	}
+
+	auto tree_value = MakeFixedDepthTreeValue(ExpressionExecutor::EvaluateScalar(context, *arguments[0]));
+	function.return_type = tree_value.type();
+	Function::EraseArgument(function, arguments, 0);
+	return make_uniq<FixedDepthTreeBindData>(std::move(tree_value));
+}
+
+static unique_ptr<Expression> BindFixedDepthTreeExpression(FunctionBindExpressionInput &input) {
+	D_ASSERT(input.bind_data);
+	auto &bind_data = input.bind_data->Cast<FixedDepthTreeBindData>();
+	return make_uniq<BoundConstantExpression>(std::move(bind_data.tree_value));
+}
+
 static void UnboundDecisionTree(DataChunk &, ExpressionState &, Vector &) {
 	throw InternalException("decision_tree evaluator was not selected during binding");
+}
+
+static void UnboundFixedDepthTree(DataChunk &, ExpressionState &, Vector &) {
+	throw InternalException("fixed_depth evaluator was not selected during binding");
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1429,6 +1622,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.SetSerializeCallback(SerializeDecisionTree);
 	function.SetDeserializeCallback(DeserializeDecisionTree);
 	loader.RegisterFunction(function);
+
+	ScalarFunction fixed_depth_function("fixed_depth", {LogicalType::ANY}, LogicalType::ANY, UnboundFixedDepthTree,
+	                                    BindFixedDepthTree);
+	fixed_depth_function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	fixed_depth_function.SetBindExpressionCallback(BindFixedDepthTreeExpression);
+	loader.RegisterFunction(fixed_depth_function);
 }
 
 } // namespace

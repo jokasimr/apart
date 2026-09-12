@@ -15,6 +15,20 @@ The first form accepts one or more feature arguments. The second accepts a fixed
 
 The tree must be constant for the query. Its leaf values must have one common type, which becomes the return type `T`. Leaf values may use any DuckDB type, including `STRUCT`, `LIST`, and `ARRAY`.
 
+Variable-depth trees can be converted explicitly with `fixed_depth`:
+
+```sql
+decision_tree(fixed_depth(tree), x1, x2, ..., xn) -> T
+```
+
+`fixed_depth(tree)` pads every shallow leaf to the tree's existing maximum depth. Synthetic nodes send both
+outcomes to the same original leaf, so predictions are unchanged and the `values` field is not expanded. The result
+can use the faster implicit fixed-depth kernels. The tree argument must be constant, and an already fixed-depth tree
+is returned unchanged. Conversion happens once during binding; the helper has no per-row execution cost.
+
+Padding creates a complete topology with `2^D - 1` internal nodes for maximum depth `D`. To prevent accidental
+excessive expansion, the helper rejects padding that would create more than 1,000,000 internal nodes.
+
 ## Tree format
 
 A tree is a `STRUCT` with four fields:

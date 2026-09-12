@@ -1,5 +1,5 @@
 # name: test/sql/apart.test
-# description: decision_tree scalar function
+# description: decision-tree scalar functions
 # group: [sql]
 
 require apart
@@ -503,6 +503,144 @@ FROM (VALUES (-1.0::FLOAT), (5.0::FLOAT), (10.0::FLOAT)) features(x);
 10
 20
 30
+
+# fixed_depth explicitly pads a constant tree to its maximum depth. The
+# leaf-value array is retained rather than expanded with the topology.
+statement ok
+CREATE MACRO padding_test_tree() AS {
+    weights: [[1], [1], [1]],
+    thresholds: [0, 10, 20],
+    children: [[2, -1], [3, -2], [-4, -3]],
+    values: [10, 20, 30, 40]
+};
+
+query IIII
+SELECT len(tree.weights), len(tree.thresholds), len(tree.children), len(tree.values)
+FROM (SELECT fixed_depth(padding_test_tree()) AS tree);
+----
+7	7	7	4
+
+query II
+SELECT
+    tree.thresholds = [0, 10, 0, 20, 0, 0, 0],
+    tree.children = [[2, 3], [4, 5], [6, 7], [-4, -3], [-2, -2], [-1, -1], [-1, -1]]
+FROM (SELECT fixed_depth(padding_test_tree()) AS tree);
+----
+1	1
+
+query I
+SELECT fixed_depth(padding_test_tree()).values = padding_test_tree().values;
+----
+1
+
+# Padding is idempotent, including when fixed_depth calls are nested.
+query I
+SELECT fixed_depth(fixed_depth(padding_test_tree())) = fixed_depth(padding_test_tree());
+----
+1
+
+query I
+SELECT count(*)
+FROM (VALUES
+    (-1.0::FLOAT),
+    (5.0::FLOAT),
+    (15.0::FLOAT),
+    (25.0::FLOAT),
+    ('NaN'::FLOAT),
+    (NULL::FLOAT)
+) features(x)
+WHERE decision_tree(fixed_depth(padding_test_tree()), x)
+      IS DISTINCT FROM decision_tree(padding_test_tree(), x);
+----
+0
+
+# A leaf may be referenced from several depths without duplicating its value.
+statement ok
+CREATE MACRO shared_leaf_padding_test_tree() AS {
+    weights: [[1], [1], [1]],
+    thresholds: [0, 10, 20],
+    children: [[2, -1], [3, -1], [-2, -1]],
+    values: [
+        {label: 'shared', payload: [10, 20]},
+        {label: 'deep', payload: [30, 40]}
+    ]
+};
+
+query I
+SELECT len(fixed_depth(shared_leaf_padding_test_tree()).values);
+----
+2
+
+query I
+SELECT count(*)
+FROM (VALUES
+    (-1.0::FLOAT),
+    (5.0::FLOAT),
+    (15.0::FLOAT),
+    (25.0::FLOAT),
+    (NULL::FLOAT)
+) features(x)
+WHERE decision_tree(fixed_depth(shared_leaf_padding_test_tree()), x)
+      IS DISTINCT FROM decision_tree(shared_leaf_padding_test_tree(), x);
+----
+0
+
+# Named STRUCT fields retain their authored order.
+query I
+SELECT struct_keys(fixed_depth({
+    values: [10, 20, 30],
+    children: [[2, -1], [-3, -2]],
+    thresholds: [0, 10],
+    weights: [[1], [1]]
+})) = ['values', 'children', 'thresholds', 'weights'];
+----
+1
+
+# An already fixed-depth tree is returned unchanged.
+query I
+SELECT fixed_depth(fixed_depth_test_tree()) = fixed_depth_test_tree();
+----
+1
+
+# LIST and ARRAY tree fields are both accepted and retain their container kind.
+statement ok
+CREATE MACRO array_padding_test_tree() AS {
+    weights: array_value(array_value(1.0::FLOAT), array_value(1.0::FLOAT)),
+    thresholds: array_value(0.0::FLOAT, 10.0::FLOAT),
+    children: array_value(array_value(2, -1), array_value(-3, -2)),
+    values: array_value('negative', 'low', 'high')
+};
+
+query TTTT
+SELECT typeof(tree.weights), typeof(tree.thresholds), typeof(tree.children), typeof(tree.values)
+FROM (SELECT fixed_depth(array_padding_test_tree()) AS tree);
+----
+FLOAT[1][3]	FLOAT[3]	BIGINT[2][3]	VARCHAR[3]
+
+query T
+SELECT decision_tree(fixed_depth(array_padding_test_tree()), 5.0::FLOAT);
+----
+low
+
+# The helper must be constant so decision_tree can consume it during binding.
+statement error
+SELECT fixed_depth(tree_value)
+FROM (VALUES (padding_test_tree())) trees(tree_value);
+----
+<REGEX>:.*fixed_depth.*constant.*
+
+# Sparse deep trees are rejected before their complete topology is allocated.
+statement error
+SELECT fixed_depth({
+    weights: list_transform(range(20), lambda i: [1.0::FLOAT]),
+    thresholds: list_transform(range(20), lambda i: 0.0::FLOAT),
+    children: list_transform(range(20), lambda i:
+        CASE WHEN i = 19 THEN [-1, -1] ELSE [i + 2, -1] END
+    ),
+    values: [42]
+});
+----
+<REGEX>:.*would create 1048575 internal nodes.*limit.*
 
 # Equal-depth trees use implicit topology while preserving repeated leaf values.
 query I
