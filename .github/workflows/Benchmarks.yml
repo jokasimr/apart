@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   benchmark:
-    name: Compare current and previous commits
+    name: Compare current and baseline revisions
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -43,7 +43,6 @@ jobs:
           CURRENT_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           current_revision=$(git rev-parse HEAD)
-          previous_revision=$(git rev-parse HEAD^)
           current_run_id="$CURRENT_RUN_ID"
           if [ -z "$current_run_id" ]; then
             current_run_id=$(gh run list \
@@ -54,21 +53,50 @@ jobs:
               --json databaseId \
               --jq '.[0].databaseId')
           fi
-          previous_run_id=$(gh run list \
-            --workflow MainDistributionPipeline.yml \
-            --commit "$previous_revision" \
-            --status success \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId')
           test -n "$current_run_id"
-          test -n "$previous_run_id"
           gh run download "$current_run_id" \
             --name apart-v1.5.4-extension-linux_amd64 \
             --dir extension-current
-          gh run download "$previous_run_id" \
-            --name apart-v1.5.4-extension-linux_amd64 \
-            --dir extension-previous
+
+          previous_revision=""
+          baseline_extension=""
+          baseline_artifact=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[]
+              | select(.expired == false)
+              | select(.workflow_run.head_branch == "main")
+              | select(.name | startswith("benchmark-results-"))]
+              | sort_by(.created_at)
+              | last
+              | if . == null then "" else "\(.workflow_run.id)\t\(.name)" end')
+          if [ -n "$baseline_artifact" ]; then
+            IFS=$'\t' read -r baseline_run_id baseline_artifact_name <<< "$baseline_artifact"
+            gh run download "$baseline_run_id" \
+              --name "$baseline_artifact_name" \
+              --dir benchmark-baseline
+            baseline_metadata=$(find benchmark-baseline -name metadata.json -print -quit)
+            test -n "$baseline_metadata"
+            previous_revision=$(jq -r '.current.revision' "$baseline_metadata")
+            baseline_extension=$(find benchmark-baseline -name apart.duckdb_extension -print -quit)
+          fi
+
+          if [ -n "$baseline_extension" ]; then
+            mkdir -p extension-previous
+            cp "$baseline_extension" extension-previous/apart.duckdb_extension
+          elif [ -n "$previous_revision" ]; then
+            previous_run_id=$(gh run list \
+              --workflow MainDistributionPipeline.yml \
+              --commit "$previous_revision" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+            if [ -z "$previous_run_id" ] || ! gh run download "$previous_run_id" \
+                --name apart-v1.5.4-extension-linux_amd64 \
+                --dir extension-previous; then
+              previous_revision=""
+            fi
+          fi
           echo "current=$current_revision" >> "$GITHUB_OUTPUT"
           echo "previous=$previous_revision" >> "$GITHUB_OUTPUT"
 
@@ -80,15 +108,24 @@ jobs:
           unzip -q duckdb.zip -d duckdb
 
       - name: Run benchmark matrix
+        env:
+          CURRENT_REVISION: ${{ steps.revisions.outputs.current }}
+          PREVIOUS_REVISION: ${{ steps.revisions.outputs.previous }}
         run: |
+          comparison_args=()
+          if [ -n "$PREVIOUS_REVISION" ]; then
+            comparison_args=(
+              --previous-extension extension-previous/apart.duckdb_extension
+              --previous-revision "$PREVIOUS_REVISION"
+            )
+          fi
           python3 benchmark/run_matrix.py \
             --duckdb-binary duckdb/duckdb \
             --current-extension extension-current/apart.duckdb_extension \
-            --previous-extension extension-previous/apart.duckdb_extension \
-            --current-revision "${{ steps.revisions.outputs.current }}" \
-            --previous-revision "${{ steps.revisions.outputs.previous }}" \
+            --current-revision "$CURRENT_REVISION" \
             --repository "${{ github.repository }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "${comparison_args[@]}" \
             --output benchmark-results
 
       - name: Upload benchmark results
@@ -101,8 +138,6 @@ jobs:
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3

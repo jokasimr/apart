@@ -6,7 +6,7 @@ Feature counts 1–5 use 20,000,000 rows per case, 6–10 use 10,000,000 rows, 2
 
 Fixed trees always traverse exactly `D` nodes. In variable trees, approximately half the rows stop at `D-1` and half at `D`, keeping the transition from fully active to partially active lanes deliberate and repeatable. A genuinely variable-depth tree cannot have maximum depth 1, so those cells are recorded as not applicable rather than silently substituting a fixed-depth tree.
 
-The runner uses deterministic feature data and tree weights, prepares every query before profiling, executes with one DuckDB thread, shuffles cases each round, and verifies result checksums. It stores every timing sample as JSON, writes a CSV comparison, and generates the static benchmark page.
+The runner uses deterministic feature data and tree weights, prepares every query before profiling, executes with one DuckDB thread, shuffles cases each round, and verifies result checksums. The baseline and current revisions run in a balanced baseline/current/current/baseline order to limit time-dependent bias. It stores every timing sample as JSON, writes a CSV comparison, and generates the static benchmark page.
 
 For a small local check against another build:
 
@@ -25,4 +25,6 @@ python3 benchmark/run_matrix.py \
   --runs 3
 ```
 
-The benchmark workflow runs after the existing extension build completes on `main`. It downloads the extension artifacts produced for the current commit and its first parent, then loads both into the official DuckDB v1.5.4 shell. It builds nothing. The workflow uploads the raw files as artifacts and publishes the latest comparison through GitHub Pages.
+Omit `--previous-extension` and `--previous-revision` to generate current results without a comparison.
+
+The benchmark workflow runs after the existing extension build completes on `main`. It compares that build with the exact extension saved by the latest completed benchmark, loading both into the official DuckDB v1.5.4 shell. It builds nothing. Each results artifact includes the current extension so it can become the next baseline. When no baseline is available, the workflow publishes only the current results and establishes one for the next run. The workflow also publishes the latest results through GitHub Pages.

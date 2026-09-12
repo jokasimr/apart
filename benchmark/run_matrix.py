@@ -290,6 +290,37 @@ def run_extension(
     return records
 
 
+def merge_measurements(first: list[dict], second: list[dict]) -> list[dict]:
+    second_by_key = {
+        (record["tree_kind"], record["feature_count"], record["depth"]): record for record in second
+    }
+    if len(first) != len(second) or len(second_by_key) != len(second):
+        raise RuntimeError("benchmark passes produced different cases")
+
+    merged = []
+    for first_record in first:
+        key = (first_record["tree_kind"], first_record["feature_count"], first_record["depth"])
+        second_record = second_by_key.get(key)
+        if second_record is None:
+            raise RuntimeError(f"benchmark case {key} is missing from one pass")
+        if first_record["rows"] != second_record["rows"]:
+            raise RuntimeError(f"row count differs between benchmark passes for {key}")
+        if first_record["checksum"] != second_record["checksum"]:
+            raise RuntimeError(f"checksum differs between benchmark passes for {key}")
+
+        samples = first_record["samples_ns_per_row"] + second_record["samples_ns_per_row"]
+        record = dict(first_record)
+        record.update(
+            {
+                "median_ns_per_row": statistics.median(samples),
+                "mad_ns_per_row": median_absolute_deviation(samples),
+                "samples_ns_per_row": samples,
+            }
+        )
+        merged.append(record)
+    return merged
+
+
 def add_not_applicable(
     records: list[dict], row_counts: dict[int, int], feature_counts: tuple[int, ...], depths: tuple[int, ...]
 ) -> None:
@@ -395,6 +426,12 @@ def result_table(
             if record["status"] != "measured":
                 cells.append(f'<td class="na" title="{html.escape(record["reason"])}">N/A</td>')
                 continue
+            if "speedup_percent" not in record:
+                cells.append(
+                    f'<td title="Current MAD: {record["mad_ns_per_row"]:.3f} ns">'
+                    f'<span class="time">{record["median_ns_per_row"]:.3f}</span></td>'
+                )
+                continue
             speedup = record["speedup_percent"]
             result_class = "faster" if speedup > 1 else "slower" if speedup < -1 else "neutral"
             cells.append(
@@ -417,7 +454,7 @@ def result_table(
 
 def write_page(
     path: Path,
-    comparison: list[dict],
+    records: list[dict],
     metadata: dict,
     feature_counts: tuple[int, ...],
     depths: tuple[int, ...],
@@ -429,8 +466,39 @@ def write_page(
         f'<a href="{html.escape(metadata["run_url"])}">workflow run</a>' if metadata["run_url"] else "workflow run"
     )
     generated = html.escape(metadata["generated_at"])
-    fixed_table = result_table("fixed", comparison, feature_counts, depths)
-    variable_table = result_table("variable", comparison, feature_counts, depths)
+    fixed_table = result_table("fixed", records, feature_counts, depths)
+    variable_table = result_table("variable", records, feature_counts, depths)
+    if previous is None:
+        summary = (
+            f'Current {revision_link(repository, current["revision"])}. No earlier benchmark was available; '
+            f"this run establishes the baseline. Generated {generated} by the {run_link}."
+        )
+        result_description = "Each cell shows the current median CPU time in ns/row."
+        order_description = "Only the current revision was measured because no baseline was available."
+        version_description = f'Current DuckDB: <code>{html.escape(current["duckdb_version"])}</code>'
+        download_description = '<a href="data/current.json">current raw samples</a>'
+    else:
+        summary = (
+            f'Current {revision_link(repository, current["revision"])} versus benchmark baseline '
+            f'{revision_link(repository, previous["revision"])}. Generated {generated} by the {run_link}.'
+        )
+        result_description = (
+            "Each cell shows current median CPU time in ns/row, the change from the baseline, and the baseline "
+            "median. Positive percentages are faster. Green/red begins outside a ±1% neutral band; all "
+            "measured deltas remain visible."
+        )
+        order_description = (
+            "The revisions run in a balanced baseline/current/current/baseline order to limit time-dependent bias."
+        )
+        version_description = (
+            f'Current DuckDB: <code>{html.escape(current["duckdb_version"])}</code><br>'
+            f'Baseline DuckDB: <code>{html.escape(previous["duckdb_version"])}</code>'
+        )
+        download_description = (
+            '<a href="data/current.json">current raw samples</a>, '
+            '<a href="data/previous.json">baseline raw samples</a>, or '
+            '<a href="data/comparison.csv">the comparison CSV</a>'
+        )
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -458,10 +526,8 @@ code {{ font-size: .9em; }}
 </head>
 <body>
 <h1>Apart benchmark matrix</h1>
-<p class="summary">Current {revision_link(repository, current["revision"])} versus previous
-{revision_link(repository, previous["revision"])}. Generated {generated} by the {run_link}.</p>
-<p>Each cell shows current median CPU time in ns/row, the change from the previous commit, and the previous median.
-Positive percentages are faster. Green/red begins outside a ±1% neutral band; all measured deltas remain visible.</p>
+<p class="summary">{summary}</p>
+<p>{result_description}</p>
 <h2>Fixed-depth trees</h2>
 <p>Every row traverses exactly the displayed depth.</p>
 {fixed_table}
@@ -472,13 +538,9 @@ Positive percentages are faster. Green/red begins outside a ±1% neutral band; a
 <p>Row counts by feature count: {html.escape(metadata["row_count_summary"])}.
 Each case has {metadata["warmups"]} warm-up rounds and {metadata["runs"]} measured rounds,
 using one DuckDB thread pinned to CPU {metadata["cpu"]}.
-Cases are shuffled independently in every round. Hover over a cell for its median absolute deviation.</p>
-<p>Current DuckDB: <code>{html.escape(current["duckdb_version"])}</code><br>
-Previous DuckDB: <code>{html.escape(previous["duckdb_version"])}</code><br>
-Host: <code>{html.escape(metadata["host"])}</code></p>
-<p>Download <a href="data/current.json">current raw samples</a>,
-<a href="data/previous.json">previous raw samples</a>, or
-<a href="data/comparison.csv">the comparison CSV</a>.</p>
+Cases are shuffled in every round. {order_description} Hover over a cell for its median absolute deviation.</p>
+<p>{version_description}<br>Host: <code>{html.escape(metadata["host"])}</code></p>
+<p>Download {download_description}.</p>
 </body>
 </html>
 """
@@ -489,9 +551,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb-binary", type=Path, required=True)
     parser.add_argument("--current-extension", type=Path, required=True)
-    parser.add_argument("--previous-extension", type=Path, required=True)
+    parser.add_argument("--previous-extension", type=Path)
     parser.add_argument("--current-revision", required=True)
-    parser.add_argument("--previous-revision", required=True)
+    parser.add_argument("--previous-revision")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repository", default="")
     parser.add_argument("--run-url", default="")
@@ -505,8 +567,12 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=7200)
     args = parser.parse_args()
 
+    if (args.previous_extension is None) != (args.previous_revision is None):
+        parser.error("previous extension and revision must be provided together")
     if (args.rows is not None and args.rows < 1) or args.warmups < 0 or args.runs < 1:
         parser.error("rows and runs must be positive; warmups cannot be negative")
+    if args.previous_extension is not None and args.runs < 2:
+        parser.error("comparisons need at least two measured runs")
     if args.cpu is None:
         available_cpus = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
         cpu = min(available_cpus) if available_cpus else None
@@ -517,18 +583,48 @@ def main() -> None:
         feature_count: args.rows or default_row_count(feature_count) for feature_count in args.features
     }
     row_groups = group_row_counts(row_counts, args.features)
-    sql, executions = build_sql(row_counts, args.warmups, args.runs, args.seed, args.features, args.depths)
     duckdb_binary = args.duckdb_binary.resolve()
     duckdb_version = binary_version(duckdb_binary)
-    previous_records = run_extension(
-        duckdb_binary, args.previous_extension, sql, executions, cpu, args.timeout
-    )
-    current_records = run_extension(
-        duckdb_binary, args.current_extension, sql, executions, cpu, args.timeout
-    )
-    add_not_applicable(previous_records, row_counts, args.features, args.depths)
+    if args.previous_extension is None:
+        sql, executions = build_sql(
+            row_counts, args.warmups, args.runs, args.seed, args.features, args.depths
+        )
+        current_records = run_extension(
+            duckdb_binary, args.current_extension, sql, executions, cpu, args.timeout
+        )
+        previous_records = None
+    else:
+        first_runs = (args.runs + 1) // 2
+        second_runs = args.runs // 2
+        first_warmups = (args.warmups + 1) // 2
+        second_warmups = args.warmups // 2
+        first_sql, first_executions = build_sql(
+            row_counts, first_warmups, first_runs, args.seed, args.features, args.depths
+        )
+        second_sql, second_executions = build_sql(
+            row_counts, second_warmups, second_runs, args.seed, args.features, args.depths
+        )
+        previous_first = run_extension(
+            duckdb_binary, args.previous_extension, first_sql, first_executions, cpu, args.timeout
+        )
+        current_first = run_extension(
+            duckdb_binary, args.current_extension, first_sql, first_executions, cpu, args.timeout
+        )
+        current_second = run_extension(
+            duckdb_binary, args.current_extension, second_sql, second_executions, cpu, args.timeout
+        )
+        previous_second = run_extension(
+            duckdb_binary, args.previous_extension, second_sql, second_executions, cpu, args.timeout
+        )
+        previous_records = merge_measurements(previous_first, previous_second)
+        current_records = merge_measurements(current_first, current_second)
+        add_not_applicable(previous_records, row_counts, args.features, args.depths)
     add_not_applicable(current_records, row_counts, args.features, args.depths)
-    comparison = comparison_records(current_records, previous_records)
+    page_records = (
+        current_records
+        if previous_records is None
+        else comparison_records(current_records, previous_records)
+    )
 
     generated_at = datetime.now(timezone.utc).isoformat()
     metadata = {
@@ -552,27 +648,48 @@ def main() -> None:
             "fixed": "all paths have depth D",
             "variable": "approximately half the rows stop at depth D-1 and half at depth D",
         },
-        "previous": {"revision": args.previous_revision, "duckdb_version": duckdb_version},
+        "revision_order": (
+            ["current"]
+            if previous_records is None
+            else ["previous", "current", "current", "previous"]
+        ),
+        "previous": (
+            None
+            if previous_records is None
+            else {"revision": args.previous_revision, "duckdb_version": duckdb_version}
+        ),
         "current": {"revision": args.current_revision, "duckdb_version": duckdb_version},
     }
     current_result = {"metadata": metadata, "revision": metadata["current"], "results": current_records}
-    previous_result = {"metadata": metadata, "revision": metadata["previous"], "results": previous_records}
 
     artifact_directory = args.output / "artifacts"
     site_directory = args.output / "site"
     site_data_directory = site_directory / "data"
     artifact_directory.mkdir(parents=True, exist_ok=True)
     site_data_directory.mkdir(parents=True, exist_ok=True)
+    for name in ("previous.json", "comparison.csv"):
+        (artifact_directory / name).unlink(missing_ok=True)
+        (site_data_directory / name).unlink(missing_ok=True)
     write_json(artifact_directory / "current.json", current_result)
-    write_json(artifact_directory / "previous.json", previous_result)
     write_json(artifact_directory / "metadata.json", metadata)
-    write_comparison_csv(artifact_directory / "comparison.csv", comparison)
-    for name in ("current.json", "previous.json", "comparison.csv"):
+    shutil.copy2(args.current_extension, artifact_directory / "apart.duckdb_extension")
+    site_files = ["current.json"]
+    if previous_records is not None:
+        previous_result = {
+            "metadata": metadata,
+            "revision": metadata["previous"],
+            "results": previous_records,
+        }
+        write_json(artifact_directory / "previous.json", previous_result)
+        write_comparison_csv(artifact_directory / "comparison.csv", page_records)
+        site_files.extend(("previous.json", "comparison.csv"))
+    for name in site_files:
         shutil.copy2(artifact_directory / name, site_data_directory / name)
-    write_page(site_directory / "index.html", comparison, metadata, args.features, args.depths)
+    write_page(site_directory / "index.html", page_records, metadata, args.features, args.depths)
 
-    measured = sum(record["status"] == "measured" for record in comparison)
-    print(f"wrote {measured} measured comparisons to {args.output}")
+    measured = sum(record["status"] == "measured" for record in page_records)
+    noun = "results" if previous_records is None else "comparisons"
+    print(f"wrote {measured} measured {noun} to {args.output}")
 
 
 if __name__ == "__main__":
