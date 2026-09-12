@@ -92,4 +92,4 @@ make test
 
 ## Benchmarks
 
-The [benchmark dashboard](https://jokasimr.github.io/apart/) compares the complete traversal matrix against the latest completed benchmark. Raw samples, the tested extension, and the generated results are retained as artifacts by the benchmark workflow. See [benchmark/README.md](benchmark/README.md) for the matrix definition and local usage.
+The [benchmark dashboard](https://jokasimr.github.io/apart/) lists published results by revision. When a baseline is available, each report compares the complete traversal matrix against it. Raw samples, the tested extension, and the generated results are retained as artifacts by the benchmark workflow. See [benchmark/README.md](benchmark/README.md) for the matrix definition and local usage.
