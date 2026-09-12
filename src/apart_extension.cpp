@@ -158,7 +158,7 @@ struct DecisionTreeLocalState final : FunctionLocalState {
 
 static const vector<Value> &SequenceValues(const Value &value, const string &path) {
 	if (value.IsNull()) {
-		throw BinderException("decision_tree %s cannot be NULL", path);
+		throw BinderException("%s cannot be NULL", path);
 	}
 	if (value.type().id() == LogicalTypeId::LIST) {
 		return ListValue::GetChildren(value);
@@ -166,7 +166,7 @@ static const vector<Value> &SequenceValues(const Value &value, const string &pat
 	if (value.type().id() == LogicalTypeId::ARRAY) {
 		return ArrayValue::GetChildren(value);
 	}
-	throw BinderException("decision_tree %s must be a LIST or ARRAY, not %s", path, value.type().ToString());
+	throw BinderException("%s must be a list or array; got %s", path, value.type().ToString());
 }
 
 static optional_idx FindStructField(const child_list_t<LogicalType> &fields, const string &name) {
@@ -181,7 +181,7 @@ static optional_idx FindStructField(const child_list_t<LogicalType> &fields, con
 static idx_t RequireStructField(const child_list_t<LogicalType> &fields, const string &name, const string &path) {
 	auto result = FindStructField(fields, name);
 	if (!result.IsValid()) {
-		throw BinderException("decision_tree %s is missing required field '%s'", path, name);
+		throw BinderException("%s is missing required field '%s'", path, name);
 	}
 	return result.GetIndex();
 }
@@ -191,29 +191,31 @@ static void RequireFloatingType(const LogicalType &type, const string &descripti
 		throw ParameterNotResolvedException();
 	}
 	if (type != LogicalType::FLOAT && type != LogicalType::DOUBLE) {
-		throw BinderException("decision_tree %s must be FLOAT or DOUBLE, not %s", description, type.ToString());
+		throw BinderException("decision_tree %s must be FLOAT or DOUBLE; got %s. "
+		                      "For numeric inputs, use ::FLOAT or ::DOUBLE",
+		                      description, type.ToString());
 	}
 }
 
 static void IncludeCommonType(LogicalType &current, const LogicalType &type, const string &path) {
 	LogicalType combined;
 	if (!LogicalType::TryGetMaxLogicalTypeUnchecked(current, type, combined)) {
-		throw BinderException("decision_tree %s has type %s, which cannot be combined with %s", path, type.ToString(),
-		                      current.ToString());
+		throw BinderException("%s has type %s, which cannot be combined with the other weights and thresholds (%s)",
+		                      path, type.ToString(), current.ToString());
 	}
 	current = std::move(combined);
 }
 
 static void IncludeParameterType(LogicalType &current, const LogicalType &type, const string &path) {
 	if (!type.IsNumeric()) {
-		throw BinderException("decision_tree %s must be numeric, not %s", path, type.ToString());
+		throw BinderException("%s must be a number; got %s", path, type.ToString());
 	}
 	IncludeCommonType(current, type, path);
 }
 
 static int64_t ReadChildReference(const Value &value, const string &path) {
 	if (value.IsNull()) {
-		throw BinderException("decision_tree %s cannot be NULL", path);
+		throw BinderException("%s cannot be NULL", path);
 	}
 	switch (value.type().id()) {
 	case LogicalTypeId::TINYINT:
@@ -223,26 +225,29 @@ static int64_t ReadChildReference(const Value &value, const string &path) {
 	case LogicalTypeId::HUGEINT:
 		break;
 	default:
-		throw BinderException("decision_tree %s must be a signed integer, not %s", path, value.type().ToString());
+		throw BinderException("%s must use an integer type that allows negative numbers; got %s. Cast it with ::BIGINT",
+		                      path, value.type().ToString());
 	}
 	int64_t reference;
 	try {
 		reference = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-	} catch (Exception &ex) {
-		throw BinderException("decision_tree %s is outside the supported BIGINT range: %s", path, ex.what());
+	} catch (Exception &) {
+		throw BinderException("%s must be within the BIGINT range (-9223372036854775808 to 9223372036854775807); got %s",
+		                      path, value.ToString());
 	}
 	if (reference == 0) {
-		throw BinderException("decision_tree %s cannot be 0", path);
+		throw BinderException("%s cannot be 0; use 1 for the first node or -1 for the first entry in tree.values", path);
 	}
 	return reference > 0 ? reference - 1 : reference;
 }
 
 static ParsedTree ParseTreeValue(const Value &tree_value) {
 	if (tree_value.IsNull()) {
-		throw BinderException("decision_tree tree cannot be NULL");
+		throw BinderException("tree cannot be NULL");
 	}
 	if (tree_value.type().id() != LogicalTypeId::STRUCT) {
-		throw BinderException("decision_tree tree must be a STRUCT, not %s", tree_value.type().ToString());
+		throw BinderException("tree must be a STRUCT with fields weights, thresholds, children, and values; got %s",
+		                      tree_value.type().ToString());
 	}
 
 	auto &fields = StructType::GetChildTypes(tree_value.type());
@@ -252,7 +257,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	auto values_idx = RequireStructField(fields, "values", "tree");
 	if (fields.size() != 4) {
 		throw BinderException(
-		    "decision_tree tree must contain exactly 'weights', 'thresholds', 'children', and 'values'");
+		    "tree must contain exactly the fields 'weights', 'thresholds', 'children', and 'values'");
 	}
 
 	auto &fields_values = StructValue::GetChildren(tree_value);
@@ -261,24 +266,24 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	auto &child_rows = SequenceValues(fields_values[children_idx], "tree.children");
 	auto &leaf_values = SequenceValues(fields_values[values_idx], "tree.values");
 	if (weight_rows.empty()) {
-		throw BinderException("decision_tree tree.weights must contain root node 1");
+		throw BinderException("tree.weights must contain at least one node; the first entry defines the starting node");
 	}
 	if (weight_rows.size() >= LEAF_MASK) {
-		throw BinderException("decision_tree supports fewer than %u internal nodes", LEAF_MASK);
+		throw BinderException("tree.weights has too many nodes; the maximum is %u", LEAF_MASK - 1);
 	}
 	if (threshold_values.size() != weight_rows.size()) {
-		throw BinderException("decision_tree tree.thresholds has %llu values, but tree.weights has %llu nodes",
-		                      threshold_values.size(), weight_rows.size());
+		throw BinderException("tree.thresholds must have one entry per node in tree.weights; expected %llu, got %llu",
+		                      weight_rows.size(), threshold_values.size());
 	}
 	if (child_rows.size() != weight_rows.size()) {
-		throw BinderException("decision_tree tree.children has %llu entries, but tree.weights has %llu nodes",
-		                      child_rows.size(), weight_rows.size());
+		throw BinderException("tree.children must have one entry per node in tree.weights; expected %llu, got %llu",
+		                      weight_rows.size(), child_rows.size());
 	}
 	if (leaf_values.empty()) {
-		throw BinderException("decision_tree tree.values must contain at least one leaf value");
+		throw BinderException("tree.values must contain at least one result value");
 	}
 	if (leaf_values.size() >= LEAF_MASK) {
-		throw BinderException("decision_tree supports fewer than %u leaves", LEAF_MASK);
+		throw BinderException("tree.values has too many entries; the maximum is %u", LEAF_MASK - 1);
 	}
 
 	ParsedTree result;
@@ -286,7 +291,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	result.leaf_type = leaf_values[0].type();
 	if (result.leaf_type.id() == LogicalTypeId::SQLNULL || result.leaf_type.id() == LogicalTypeId::UNKNOWN) {
 		throw BinderException(
-		    "decision_tree leaf values must have a concrete type; cast NULL values to the desired result type");
+		    "tree.values needs a result type; cast NULL values to the desired type, e.g. NULL::DOUBLE");
 	}
 	result.coefficients.reserve(weight_rows.size());
 	result.thresholds.reserve(weight_rows.size());
@@ -297,12 +302,15 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	for (idx_t node = 0; node < weight_rows.size(); node++) {
 		auto node_path = "tree.weights[" + to_string(node + 1) + "]";
 		auto &weight_values = SequenceValues(weight_rows[node], node_path);
+		if (weight_values.empty()) {
+			throw BinderException("%s must contain at least one weight, one for each feature input", node_path);
+		}
 		vector<Value> weights;
 		weights.reserve(weight_values.size());
 		for (idx_t weight = 0; weight < weight_values.size(); weight++) {
 			auto weight_path = node_path + "[" + to_string(weight + 1) + "]";
 			if (weight_values[weight].IsNull()) {
-				throw BinderException("decision_tree %s cannot be NULL", weight_path);
+				throw BinderException("%s cannot be NULL", weight_path);
 			}
 			IncludeParameterType(result.parameter_type, weight_values[weight].type(), weight_path);
 			weights.push_back(weight_values[weight]);
@@ -312,7 +320,7 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 		auto threshold_path = "tree.thresholds[" + to_string(node + 1) + "]";
 		auto &threshold = threshold_values[node];
 		if (threshold.IsNull()) {
-			throw BinderException("decision_tree %s cannot be NULL", threshold_path);
+			throw BinderException("%s cannot be NULL", threshold_path);
 		}
 		IncludeParameterType(result.parameter_type, threshold.type(), threshold_path);
 		result.thresholds.push_back(threshold);
@@ -320,7 +328,9 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 		auto child_path = "tree.children[" + to_string(node + 1) + "]";
 		auto &children = SequenceValues(child_rows[node], child_path);
 		if (children.size() != 2) {
-			throw BinderException("decision_tree %s must contain exactly [above, below]", child_path);
+			throw BinderException("%s must contain exactly two child references [above, below]; got %llu. "
+			                      "Use above when the weighted sum >= threshold, otherwise below",
+			                      child_path, children.size());
 		}
 		result.right_children.push_back(ReadChildReference(children[0], child_path + "[1]"));
 		result.left_children.push_back(ReadChildReference(children[1], child_path + "[2]"));
@@ -328,15 +338,12 @@ static ParsedTree ParseTreeValue(const Value &tree_value) {
 	return result;
 }
 
-static void ValidateDimensions(const ParsedTree &tree, idx_t dimensions) {
-	if (dimensions == 0) {
-		throw BinderException("decision_tree requires at least one feature");
-	}
+static void ValidateDimensions(const ParsedTree &tree, idx_t dimensions, const string &dimension_source) {
 	for (idx_t node_idx = 0; node_idx < tree.coefficients.size(); node_idx++) {
 		if (tree.coefficients[node_idx].size() != dimensions) {
 			throw BinderException(
-			    "decision_tree tree.weights[%llu] has %llu values, but the invocation has %llu features", node_idx + 1,
-			    tree.coefficients[node_idx].size(), dimensions);
+			    "tree.weights[%llu] has the wrong number of weights; expected %llu to match %s, got %llu", node_idx + 1,
+			    dimensions, dimension_source, tree.coefficients[node_idx].size());
 		}
 	}
 }
@@ -347,9 +354,8 @@ static T ReadNumber(const Value &value, const string &path) {
 	try {
 		auto cast_value = value.DefaultCastAs(target_type);
 		return cast_value.template GetValue<T>();
-	} catch (Exception &ex) {
-		throw BinderException("decision_tree %s cannot be converted to %s: %s", path, target_type.ToString(),
-		                      ex.what());
+	} catch (Exception &) {
+		throw BinderException("%s value %s cannot be converted to %s", path, value.ToString(), target_type.ToString());
 	}
 }
 
@@ -371,16 +377,17 @@ static uint32_t CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE
 	};
 	vector<TraversalFrame> stack;
 
-	auto compile_reference = [&](int64_t reference, uint32_t depth) -> uint32_t {
+	auto compile_reference = [&](int64_t reference, uint32_t depth, idx_t parent, idx_t child) -> uint32_t {
+		auto child_path = [&]() {
+			// Authored child pairs are [above, below]; traversal visits [below, above].
+			return StringUtil::Format("tree.children[%llu][%llu]", parent + 1, child == 0 ? 2 : 1);
+		};
 		if (reference < 0) {
-			if (reference == std::numeric_limits<int64_t>::min()) {
-				throw BinderException("decision_tree contains an invalid leaf reference");
-			}
-			auto leaf = UnsafeNumericCast<uint64_t>(-reference - 1);
-			if (leaf >= leaf_count) {
-				throw BinderException("decision_tree leaf reference %lld is out of range for %llu leaf values",
+			if (reference < -UnsafeNumericCast<int64_t>(leaf_count)) {
+				throw BinderException("%s is %lld; use -1 to -%llu to select an entry in tree.values", child_path(),
 				                      reference, leaf_count);
 			}
+			auto leaf = UnsafeNumericCast<uint64_t>(-reference - 1);
 			leaf_used[leaf] = true;
 			max_depth = MaxValue(max_depth, depth);
 			if (!found_leaf) {
@@ -400,16 +407,17 @@ static uint32_t CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE
 
 		auto source_index = UnsafeNumericCast<uint64_t>(reference);
 		if (source_index >= node_count) {
-			throw BinderException("decision_tree internal-node reference %lld is out of range for %llu nodes",
+			throw BinderException("%s refers to node %lld, but valid node numbers are 1 to %llu", child_path(),
 			                      reference + 1, node_count);
 		}
 		auto source = UnsafeNumericCast<uint32_t>(source_index);
 		if (node_state[source] == 1) {
-			throw BinderException("decision_tree topology contains a cycle at internal node %lld", reference + 1);
+			throw BinderException("%s points back to node %lld, creating a loop", child_path(), reference + 1);
 		}
 		if (node_state[source] == 2) {
-			throw BinderException("decision_tree topology reuses internal node %lld; topology must be a tree",
-			                      reference + 1);
+			throw BinderException("%s refers to node %lld, which is already used by another branch; each decision node "
+			                      "can be used only once",
+			                      child_path(), reference + 1);
 		}
 
 		node_state[source] = 1;
@@ -420,7 +428,7 @@ static uint32_t CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE
 		return target;
 	};
 
-	result.root = compile_reference(0, 0);
+	result.root = compile_reference(0, 0, 0, 0);
 	while (!stack.empty()) {
 		auto &node = stack.back();
 		if (node.next_child == 2) {
@@ -434,18 +442,20 @@ static uint32_t CompileTopology(const ParsedTree &tree, TREE &result, INITIALIZE
 		auto depth = node.depth + 1;
 		auto child = node.next_child++;
 		auto reference = child == 0 ? tree.left_children[source] : tree.right_children[source];
-		auto compiled_child = compile_reference(reference, depth);
+		auto compiled_child = compile_reference(reference, depth, source, child);
 		result.nodes[target].children[child] = compiled_child;
 	}
 
 	for (idx_t node_idx = 0; node_idx < node_count; node_idx++) {
 		if (node_state[node_idx] == 0) {
-			throw BinderException("decision_tree contains unreachable internal node %llu", node_idx + 1);
+			throw BinderException("tree node %llu is not connected to the starting node (node 1); check tree.children",
+			                      node_idx + 1);
 		}
 	}
 	for (idx_t leaf_idx = 0; leaf_idx < leaf_count; leaf_idx++) {
 		if (!leaf_used[leaf_idx]) {
-			throw BinderException("decision_tree contains unreachable leaf value %llu", leaf_idx + 1);
+			throw BinderException("tree.values[%llu] is unused; add a child reference of -%llu or remove this value",
+			                      leaf_idx + 1, leaf_idx + 1);
 		}
 	}
 	return max_depth;
@@ -515,7 +525,7 @@ static void PlacePaddedTopology(const ParsedTopology &tree, uint32_t reference, 
 static Value MakeFixedDepthTreeValue(const Value &tree_value) {
 	auto parsed_tree = ParseTreeValue(tree_value);
 	auto dimensions = parsed_tree.coefficients[0].size();
-	ValidateDimensions(parsed_tree, dimensions);
+	ValidateDimensions(parsed_tree, dimensions, "tree.weights[1]");
 
 	ParsedTopology topology;
 	auto maximum_depth =
@@ -528,15 +538,15 @@ static Value MakeFixedDepthTreeValue(const Value &tree_value) {
 
 	D_ASSERT(maximum_depth > 0);
 	if (maximum_depth >= std::numeric_limits<uint64_t>::digits) {
-		throw BinderException("fixed_depth cannot represent a fully padded tree of depth %u", maximum_depth);
+		throw BinderException("fixed_depth cannot expand a path of %u decisions within the limit of %llu nodes. "
+		                      "Use decision_tree(tree, ...) without fixed_depth",
+		                      maximum_depth, MAX_PADDED_NODE_COUNT);
 	}
 	auto padded_leaf_count = uint64_t(1) << maximum_depth;
 	auto padded_node_count = padded_leaf_count - 1;
-	if (padded_node_count >= LEAF_MASK) {
-		throw BinderException("fixed_depth supports fewer than %u padded internal nodes", LEAF_MASK);
-	}
 	if (padded_node_count > MAX_PADDED_NODE_COUNT) {
-		throw BinderException("fixed_depth would create %llu internal nodes, exceeding the limit of %llu",
+		throw BinderException("fixed_depth would create %llu decision nodes, exceeding the limit of %llu. "
+		                      "Use decision_tree(tree, ...) without fixed_depth",
 		                      padded_node_count, MAX_PADDED_NODE_COUNT);
 	}
 
@@ -1482,11 +1492,14 @@ static void ConfigureFunction(ScalarFunction &function, idx_t dimensions, bool a
 static LogicalType ConfigureTypes(ScalarFunction &function, const ParsedTree &tree, idx_t dimensions, bool array_input,
                                   const vector<LogicalType> &feature_types) {
 	auto computation_type = tree.parameter_type;
-	for (auto &feature_type : feature_types) {
-		RequireFloatingType(feature_type, "features");
+	for (idx_t feature_idx = 0; feature_idx < feature_types.size(); feature_idx++) {
+		auto &feature_type = feature_types[feature_idx];
+		auto description = array_input ? "feature array elements" : "argument " + to_string(feature_idx + 2);
+		RequireFloatingType(feature_type, description);
 		LogicalType combined;
 		if (!LogicalType::TryGetMaxLogicalTypeUnchecked(computation_type, feature_type, combined)) {
-			throw BinderException("decision_tree parameters of type %s cannot be combined with features of type %s",
+			throw BinderException("decision_tree cannot combine weights and thresholds of type %s with feature values "
+			                      "of type %s; cast them to a common FLOAT or DOUBLE type",
 			                      computation_type.ToString(), feature_type.ToString());
 		}
 		computation_type = std::move(combined);
@@ -1514,21 +1527,29 @@ static LogicalType ConfigureTypes(ScalarFunction &function, const ParsedTree &tr
 static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarFunction &function,
                                                  vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() < 2) {
-		throw BinderException("decision_tree requires a tree and at least one feature");
+		throw BinderException("decision_tree requires a tree followed by at least one feature input, "
+		                      "e.g. decision_tree(tree, x::DOUBLE)");
 	}
 	if (arguments[0]->HasParameter()) {
 		throw ParameterNotResolvedException();
 	}
 	if (!arguments[0]->IsFoldable()) {
-		throw BinderException("decision_tree tree argument must be constant for a bound invocation");
+		throw BinderException("decision_tree tree must be a constant expression that can be evaluated before reading "
+		                      "rows; table columns and subqueries are not supported");
 	}
 	if (arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
-		throw BinderException("decision_tree first argument must be a constant STRUCT, not %s",
+		throw BinderException("decision_tree tree must be a STRUCT with fields weights, thresholds, children, and "
+		                      "values; got %s",
 		                      arguments[0]->return_type.ToString());
 	}
 
 	auto tree_value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
 	auto parsed_tree = ParseTreeValue(tree_value);
+	if (arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::LIST) {
+		throw BinderException("decision_tree feature input has type %s, a variable-length list. "
+		                      "Use a fixed-size array, e.g. ::DOUBLE[%llu], or pass each feature as a separate argument",
+		                      arguments[1]->return_type.ToString(), parsed_tree.coefficients[0].size());
+	}
 	bool array_input = arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::ARRAY;
 	idx_t dimensions;
 	vector<LogicalType> feature_types;
@@ -1542,7 +1563,8 @@ static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarF
 			feature_types.push_back(arguments[argument_idx]->return_type);
 		}
 	}
-	ValidateDimensions(parsed_tree, dimensions);
+	ValidateDimensions(parsed_tree, dimensions,
+	                   array_input ? "the feature array length" : "the number of feature arguments");
 
 	function.arguments.resize(arguments.size());
 	function.arguments[0] = arguments[0]->return_type;
@@ -1571,7 +1593,8 @@ static unique_ptr<FunctionData> DeserializeDecisionTree(Deserializer &deserializ
 	} else {
 		feature_types = function.arguments;
 	}
-	ValidateDimensions(parsed_tree, dimensions);
+	ValidateDimensions(parsed_tree, dimensions,
+	                   array_input ? "the feature array length" : "the number of feature arguments");
 	auto computation_type = ConfigureTypes(function, parsed_tree, dimensions, array_input, feature_types);
 	auto compiled_tree = computation_type == LogicalType::DOUBLE ? CompileTree<double>(parsed_tree, dimensions)
 	                                                             : CompileTree<float>(parsed_tree, dimensions);
@@ -1585,10 +1608,12 @@ static unique_ptr<FunctionData> BindFixedDepthTree(ClientContext &context, Scala
 		throw ParameterNotResolvedException();
 	}
 	if (!arguments[0]->IsFoldable()) {
-		throw BinderException("fixed_depth tree argument must be constant for a bound invocation");
+		throw BinderException("fixed_depth tree must be a constant expression that can be evaluated before reading "
+		                      "rows; table columns and subqueries are not supported");
 	}
 	if (arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
-		throw BinderException("fixed_depth argument must be a constant STRUCT, not %s",
+		throw BinderException("fixed_depth tree must be a STRUCT with fields weights, thresholds, children, and "
+		                      "values; got %s",
 		                      arguments[0]->return_type.ToString());
 	}
 

@@ -640,7 +640,7 @@ SELECT fixed_depth({
     values: [42]
 });
 ----
-<REGEX>:.*would create 1048575 internal nodes.*limit.*
+<REGEX>:.*would create 1048575 decision nodes.*limit of 1000000.*without fixed_depth.*
 
 # Equal-depth trees use implicit topology while preserving repeated leaf values.
 query I
@@ -689,7 +689,7 @@ SELECT decision_tree(
     123.0::FLOAT
 );
 ----
-<REGEX>:.*weights must contain root node 1.*
+<REGEX>:.*tree.weights must contain at least one node.*starting node.*
 
 # The tree must be constant and structurally valid.
 statement error
@@ -701,7 +701,7 @@ FROM (VALUES ({
     values: [0, 1]
 })) trees(tree_value);
 ----
-<REGEX>:.+
+<REGEX>:.*decision_tree tree must be a constant expression.*before reading rows.*
 
 statement error
 SELECT decision_tree(
@@ -714,7 +714,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.+
+<REGEX>:.*tree.weights\[1\].*expected 1 to match the number of feature arguments, got 2.*
 
 statement error
 SELECT decision_tree(
@@ -726,7 +726,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.+
+<REGEX>:.*tree is missing required field 'values'.*
 
 # FLOAT and DOUBLE parameters/features are promoted to DOUBLE when mixed.
 query IT
@@ -759,7 +759,7 @@ SELECT decision_tree(
     1
 );
 ----
-<REGEX>:.+
+<REGEX>:.*decision_tree argument 2 must be FLOAT or DOUBLE; got INTEGER.*::FLOAT or ::DOUBLE.*
 
 # The four fields are exact, and errors identify the indexed authored location.
 statement error
@@ -787,7 +787,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*tree.weights\[2\].*2 values.*1 features.*
+<REGEX>:.*tree.weights\[2\].*expected 1 to match the number of feature arguments, got 2.*
 
 # Parallel node arrays must have matching lengths, and each child row is [above, below].
 statement error
@@ -796,7 +796,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*thresholds has 2 values.*weights has 1 nodes.*
+<REGEX>:.*tree.thresholds must have one entry per node in tree.weights; expected 1, got 2.*
 
 statement error
 SELECT decision_tree(
@@ -812,7 +812,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*children\[1\]\[1\].*signed integer.*
+<REGEX>:.*children\[1\]\[1\].*integer type that allows negative numbers.*UINTEGER.*::BIGINT.*
 
 statement error
 SELECT decision_tree(
@@ -829,7 +829,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*internal-node reference 2 is out of range.*
+<REGEX>:.*tree.children\[1\]\[1\] refers to node 2, but valid node numbers are 1 to 1.*
 
 statement error
 SELECT decision_tree(
@@ -837,7 +837,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*leaf reference -2 is out of range.*
+<REGEX>:.*tree.children\[1\]\[1\] is -2; use -1 to -1 to select an entry in tree.values.*
 
 statement error
 SELECT decision_tree(
@@ -845,7 +845,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*cycle.*node 1.*
+<REGEX>:.*tree.children\[1\]\[1\] points back to node 1, creating a loop.*
 
 statement error
 SELECT decision_tree(
@@ -853,7 +853,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*reuses internal node 2.*
+<REGEX>:.*tree.children\[1\]\[1\] refers to node 2, which is already used by another branch.*
 
 statement error
 SELECT decision_tree(
@@ -861,7 +861,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*unreachable internal node 2.*
+<REGEX>:.*tree node 2 is not connected to the starting node \(node 1\).*tree.children.*
 
 statement error
 SELECT decision_tree(
@@ -869,7 +869,7 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*unreachable leaf value 3.*
+<REGEX>:.*tree.values\[3\] is unused; add a child reference of -3 or remove this value.*
 
 # Deep trees are compiled iteratively during binding.
 query I
@@ -894,4 +894,4 @@ SELECT decision_tree(
     1.0::FLOAT
 );
 ----
-<REGEX>:.*leaf values must have a concrete type.*
+<REGEX>:.*tree.values needs a result type.*NULL::DOUBLE.*

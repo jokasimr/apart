@@ -1,0 +1,312 @@
+# name: test/sql/errors.test
+# description: actionable errors for invalid tree and feature inputs
+# group: [sql]
+
+require apart
+
+statement ok
+CREATE MACRO error_test_tree() AS {
+    weights: [[1]], thresholds: [0], children: [[-1, -1]], values: [42]
+};
+
+statement ok
+PREPARE evaluate_error_test_tree AS SELECT decision_tree($1, 1.0::FLOAT);
+
+statement ok
+PREPARE pad_error_test_tree AS SELECT fixed_depth($1);
+
+# Both functions use the same tree format. Shared errors identify fields without
+# incorrectly naming decision_tree when the user calls fixed_depth.
+foreach validate evaluate_error_test_tree pad_error_test_tree
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), weights := NULL));
+----
+<REGEX>:Binder Error: tree\.weights cannot be NULL.*
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), thresholds := NULL));
+----
+tree.thresholds cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := NULL));
+----
+tree.children cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), "values" := NULL));
+----
+tree.values cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), weights := 42));
+----
+tree.weights must be a list or array; got INTEGER
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), weights := [NULL]));
+----
+tree.weights[1] cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), weights := [[NULL]]));
+----
+tree.weights[1][1] cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), weights := [[]]));
+----
+tree.weights[1] must contain at least one weight, one for each feature input
+
+# Parsing checks every row, including lists nested inside a fixed-size array.
+foreach weights [[1],[]] array_value([1],[])
+
+statement error
+EXECUTE ${validate}({
+    weights: ${weights}, thresholds: [0, 0], children: [[2, -1], [-1, -1]], values: [42]
+});
+----
+tree.weights[2] must contain at least one weight, one for each feature input
+
+endloop
+
+statement error
+EXECUTE ${validate}({weights: []::INTEGER[][], thresholds: [], children: []::INTEGER[][], values: [42]});
+----
+tree.weights must contain at least one node
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), weights := [['abc']]));
+----
+tree.weights[1][1] must be a number; got VARCHAR
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), thresholds := [NULL]));
+----
+tree.thresholds[1] cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), thresholds := ['abc']));
+----
+tree.thresholds[1] must be a number; got VARCHAR
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := []));
+----
+tree.children must have one entry per node in tree.weights; expected 1, got 0
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := [[NULL, -1]]));
+----
+tree.children[1][1] cannot be NULL
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := [[0, -1]]));
+----
+tree.children[1][1] cannot be 0; use 1 for the first node or -1 for the first entry in tree.values
+
+# Values beyond BIGINT should not embed a second DuckDB exception in the message.
+foreach reference 9223372036854775808 -9223372036854775809
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := [[${reference}::HUGEINT, -1]]));
+----
+tree.children[1][1] must be within the BIGINT range (-9223372036854775808 to 9223372036854775807); got
+
+endloop
+
+# BIGINT's minimum value must still produce an ordinary, located range error.
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := [[-1, '-9223372036854775808'::BIGINT]]));
+----
+tree.children[1][2] is -9223372036854775808; use -1 to -1 to select an entry in tree.values
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), children := [['9223372036854775807'::BIGINT, -1]]));
+----
+tree.children[1][1] refers to node 9223372036854775807, but valid node numbers are 1 to 1
+
+# Locations use the original node numbers and [above, below] order.
+statement error
+EXECUTE ${validate}({
+    weights: [[1], [1]], thresholds: [0, 0], children: [[-1, 2], [-1, 99]], values: [42]
+});
+----
+tree.children[2][2] refers to node 99, but valid node numbers are 1 to 2
+
+statement error
+EXECUTE ${validate}({
+    weights: [[1], [1]], thresholds: [0, 0], children: [[-1, 2], [-1, 1]], values: [42]
+});
+----
+tree.children[2][2] points back to node 1, creating a loop
+
+# Node 3 is visited second. Error locations must use its authored index (3),
+# rather than its position in the compiled tree (2).
+statement error
+EXECUTE ${validate}({
+    weights: [[1], [1], [1]], thresholds: [0, 20, 10],
+    children: [[3, -1], [-4, -3], [99, -2]], values: [10, 20, 30, 40]
+});
+----
+tree.children[3][1] refers to node 99, but valid node numbers are 1 to 3
+
+statement error
+EXECUTE ${validate}({
+    weights: [[1], [1], [1]], thresholds: [0, 20, 10],
+    children: [[3, -1], [-4, -3], [-5, -2]], values: [10, 20, 30, 40]
+});
+----
+tree.children[3][1] is -5; use -1 to -4 to select an entry in tree.values
+
+statement error
+EXECUTE ${validate}(struct_update(error_test_tree(), "values" := []));
+----
+tree.values must contain at least one result value
+
+endloop
+
+# Empty rows must fail before feature handling, including the list cast hint
+# and DuckDB's constant-NULL handling.
+foreach feature 1.0::FLOAT [1.0]::FLOAT[1] [1.0]::FLOAT[] NULL::FLOAT
+
+statement error
+SELECT decision_tree(struct_update(error_test_tree(), weights := [[]]), ${feature});
+----
+tree.weights[1] must contain at least one weight, one for each feature input
+
+endloop
+
+# Empty outer weights must fail before the list hint reads the first row.
+statement error
+SELECT decision_tree(
+    {weights: []::INTEGER[][], thresholds: [], children: []::INTEGER[][], values: [42]},
+    [1.0]::FLOAT[]
+);
+----
+tree.weights must contain at least one node
+
+# Explain the tree format when the argument is not a struct.
+statement error
+SELECT decision_tree(42, 1.0::FLOAT);
+----
+decision_tree tree must be a STRUCT with fields weights, thresholds, children, and values; got INTEGER
+
+statement error
+SELECT fixed_depth(42);
+----
+fixed_depth tree must be a STRUCT with fields weights, thresholds, children, and values; got INTEGER
+
+# fixed_depth has no feature arguments: compare weight rows to the first row.
+statement error
+SELECT fixed_depth({
+    weights: [[1], [1, 2]], thresholds: [0, 0], children: [[2, -1], [-1, -1]], values: [42]
+});
+----
+tree.weights[2] has the wrong number of weights; expected 1 to match tree.weights[1], got 2
+
+statement ok
+CREATE MACRO two_feature_error_test_tree() AS {
+    weights: [[1, 1]], thresholds: [0], children: [[-1, -1]], values: [42]
+};
+
+# A list must receive a list-specific error, not be counted as one scalar feature.
+statement error
+SELECT decision_tree(two_feature_error_test_tree(), [1, 2]::DOUBLE[]);
+----
+decision_tree feature input has type DOUBLE[], a variable-length list. Use a fixed-size array, e.g. ::DOUBLE[2], or pass each feature as a separate argument
+
+# The suggested cast is accepted.
+query I
+SELECT decision_tree(two_feature_error_test_tree(), [1, 2]::DOUBLE[2]);
+----
+42
+
+statement error
+SELECT decision_tree(two_feature_error_test_tree(), [1]::DOUBLE[1]);
+----
+tree.weights[1] has the wrong number of weights; expected 1 to match the feature array length, got 2
+
+statement error
+SELECT decision_tree(two_feature_error_test_tree(), 1.0::FLOAT, 2);
+----
+decision_tree argument 3 must be FLOAT or DOUBLE; got INTEGER. For numeric inputs, use ::FLOAT or ::DOUBLE
+
+statement error
+SELECT decision_tree(two_feature_error_test_tree(), [1, 2]::INTEGER[2]);
+----
+decision_tree feature array elements must be FLOAT or DOUBLE; got INTEGER. For numeric inputs, use ::FLOAT or ::DOUBLE
+
+# Unresolved feature parameters still bind at EXECUTE. A rejected list must not
+# prevent subsequent executions with supported scalar types.
+statement ok
+PREPARE error_test_feature_parameter AS SELECT decision_tree(error_test_tree(), $1);
+
+statement error
+EXECUTE error_test_feature_parameter([1]::DOUBLE[]);
+----
+decision_tree feature input has type DOUBLE[], a variable-length list. Use a fixed-size array, e.g. ::DOUBLE[1]
+
+query I
+EXECUTE error_test_feature_parameter(1.0::DOUBLE);
+----
+42
+
+query I
+EXECUTE error_test_feature_parameter(NULL::FLOAT);
+----
+NULL
+
+# Valid references at both ends of the leaf range, reordered nodes, and HUGEINT
+# child references must remain accepted by both specialized and generic trees.
+statement ok
+PRAGMA verify_serializer;
+
+foreach dimensions 1 8
+
+statement ok
+CREATE OR REPLACE MACRO reordered_error_test_tree() AS {
+    weights: list_transform(range(3), lambda node:
+        list_transform(range(${dimensions}), lambda feature: CASE WHEN feature = 0 THEN 1 ELSE 0 END)
+    ),
+    thresholds: [0, 20, 10],
+    children: [[3, -1], [-4, -3], [2, -2]]::HUGEINT[][],
+    values: [10, 20, 30, 40]
+};
+
+query II
+SELECT
+    decision_tree(reordered_error_test_tree(),
+        list_transform(range(${dimensions}), lambda feature:
+            CASE WHEN feature = 0 THEN x ELSE 0 END)::DOUBLE[${dimensions}]),
+    decision_tree(fixed_depth(reordered_error_test_tree()),
+        list_transform(range(${dimensions}), lambda feature:
+            CASE WHEN feature = 0 THEN x ELSE 0 END)::DOUBLE[${dimensions}])
+FROM (VALUES (-1.0::DOUBLE), (0.0::DOUBLE), (10.0::DOUBLE), (20.0::DOUBLE), (NULL::DOUBLE)) inputs(x);
+----
+10	10
+20	20
+30	30
+40	40
+NULL	NULL
+
+endloop
+
+# Large expansions explain the practical limit, including depths that would
+# overflow the node index or the padding calculation.
+foreach depth 31 63 64
+
+statement error
+SELECT fixed_depth({
+    weights: list_transform(range(${depth}), lambda i: [1]),
+    thresholds: list_transform(range(${depth}), lambda i: 0),
+    children: list_transform(range(${depth}), lambda i:
+        CASE WHEN i = ${depth} - 1 THEN [-1, -1] ELSE [-1, i + 2] END
+    ),
+    values: [42]
+});
+----
+<REGEX>:.*fixed_depth.*limit of 1000000.*Use decision_tree\(tree, ...\) without fixed_depth.*
+
+endloop
