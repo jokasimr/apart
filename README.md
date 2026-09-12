@@ -1,6 +1,6 @@
 # apart
 
-`apart` is a DuckDB extension for evaluating affine, or oblique, decision trees directly in SQL. It applies a fixed tree efficiently to many rows while keeping both the data and the computation inside DuckDB.
+`apart` is a DuckDB extension for evaluating affine, or oblique, decision trees directly in SQL. It aims to do so efficiently both for deep and shallow trees and for decisions involving few or many variables.
 
 ## Usage
 
@@ -13,21 +13,7 @@ decision_tree(tree, features)         -> T
 
 The first form accepts one or more feature arguments. The second accepts a fixed-size DuckDB `ARRAY`. Feature values must be `FLOAT` or `DOUBLE`.
 
-The tree must be constant for the query. Its leaf values must have one common type, which becomes the return type `T`. Leaf values may use any DuckDB type, including `STRUCT`, `LIST`, and `ARRAY`.
-
-Variable-depth trees can be converted explicitly with `fixed_depth`:
-
-```sql
-decision_tree(fixed_depth(tree), x1, x2, ..., xn) -> T
-```
-
-`fixed_depth(tree)` pads every shallow leaf to the tree's existing maximum depth. Synthetic nodes send both
-outcomes to the same original leaf, so predictions are unchanged and the `values` field is not expanded. The result
-can use the faster implicit fixed-depth kernels. The tree argument must be constant, and an already fixed-depth tree
-is returned unchanged. Conversion happens once during binding; the helper has no per-row execution cost.
-
-Padding creates a complete topology with `2^D - 1` internal nodes for maximum depth `D`. To prevent accidental
-excessive expansion, the helper rejects padding that would create more than 1,000,000 internal nodes.
+The tree must be constant for the query. Its leaf values must have one common type, which becomes the return type `T` of the function. Leaf values may use any DuckDB type, including `STRUCT`, `LIST`, and `ARRAY`.
 
 ## Tree format
 
@@ -96,6 +82,25 @@ FROM measurements;
 ```
 
 Weights and thresholds may use any numeric type and are converted to the feature computation type. Integer features must be cast to `FLOAT` or `DOUBLE`. If any feature is `NULL`, the result is `NULL`.
+
+
+## Fixed depth (optional optimization)
+
+Decision trees where each leaf is at the same depth are called "fixed depth trees". They can be evaluated more efficiently because every row traverses the same number of nodes.
+
+Variable-depth trees can be converted explicitly with `fixed_depth`:
+
+```sql
+decision_tree(fixed_depth(tree), x1, x2, ..., xn) -> T
+```
+
+`fixed_depth(tree)` pads every shallow leaf to the tree's existing maximum depth without changing the result. This lets `decision_tree` use fixed-depth optimizations and can speed up evaluation *if the original tree was already close to fixed depth*. But if the tree is skewed with some leaves near the root and others at much deeper levels, or if the distribution of input features is such that most rows reach a shallow leaf, then adding padding and making the depth fixed might not be beneficial.
+
+An already fixed-depth tree is returned unchanged. The conversion happens once during binding; the helper has no per-row execution cost.
+
+Padding creates a complete topology with `2^D - 1` internal nodes for maximum depth `D`. To prevent accidental
+excessive expansion for deep sparse trees, the helper rejects padding that would create more than 1,000,000 internal nodes.
+
 
 ## Building and testing
 
