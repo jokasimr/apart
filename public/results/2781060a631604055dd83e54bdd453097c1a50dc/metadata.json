@@ -1,5 +1,5 @@
 {
-  "baseline_revision": "f3206511fd324a3f7ecb78928f22f540c2406dd8",
+  "baseline_revision": "2781060a631604055dd83e54bdd453097c1a50dc",
   "cpu": 0,
   "depths": [
     1,
@@ -28,7 +28,7 @@
     20,
     100
   ],
-  "generated_at": "2026-09-12T13:00:30.238468+00:00",
+  "generated_at": "2026-09-12T13:31:41.788922+00:00",
   "host": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
   "measurement_order": [
     "baseline",
@@ -53,7 +53,7 @@
     "20": 4000000,
     "100": 700000
   },
-  "run_url": "https://github.com/jokasimr/apart/actions/runs/34694401121",
+  "run_url": "https://github.com/jokasimr/apart/actions/runs/34695791512",
   "runs": 7,
   "schema_version": 2,
   "seed": 20260912,
