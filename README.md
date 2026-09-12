@@ -89,3 +89,7 @@ Weights and thresholds may use any numeric type and are converted to the feature
 make
 make test
 ```
+
+## Benchmarks
+
+The [benchmark dashboard](https://jokasimr.github.io/apart/) compares the complete traversal matrix against the previous commit. Raw samples and the generated comparison are retained as artifacts by the benchmark workflow. See [benchmark/README.md](benchmark/README.md) for the matrix definition and local usage.

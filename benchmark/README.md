@@ -1,0 +1,28 @@
+# Benchmarks
+
+`run_matrix.py` measures `decision_tree` with feature counts 1–10, 20, and 100 and maximum depths 1–10. It covers both fixed-depth trees and variable-depth trees.
+
+Feature counts 1–5 use 20,000,000 rows per case, 6–10 use 10,000,000 rows, 20 uses 4,000,000 rows, and 100 uses 700,000 rows. This keeps the inexpensive cases long enough to produce a useful signal while keeping the most expensive cases near half a second. The four row-count groups also map directly to four shared input tables; row counts do not vary by tree shape or depth. `--rows` provides a uniform override for quick local checks.
+
+Fixed trees always traverse exactly `D` nodes. In variable trees, approximately half the rows stop at `D-1` and half at `D`, keeping the transition from fully active to partially active lanes deliberate and repeatable. A genuinely variable-depth tree cannot have maximum depth 1, so those cells are recorded as not applicable rather than silently substituting a fixed-depth tree.
+
+The runner uses deterministic feature data and tree weights, prepares every query before profiling, executes with one DuckDB thread, shuffles cases each round, and verifies result checksums. It stores every timing sample as JSON, writes a CSV comparison, and generates the static benchmark page.
+
+For a small local check against another build:
+
+```sh
+python3 benchmark/run_matrix.py \
+  --duckdb-binary /path/to/duckdb \
+  --current-extension ./build/release/extension/apart/apart.duckdb_extension \
+  --previous-extension /path/to/previous/apart.duckdb_extension \
+  --current-revision HEAD \
+  --previous-revision HEAD^ \
+  --output ./benchmark-results \
+  --features 1,2 \
+  --depths 1,2 \
+  --rows 10000 \
+  --warmups 1 \
+  --runs 3
+```
+
+The benchmark workflow runs after the existing extension build completes on `main`. It downloads the extension artifacts produced for the current commit and its first parent, then loads both into the official DuckDB v1.5.4 shell. It builds nothing. The workflow uploads the raw files as artifacts and publishes the latest comparison through GitHub Pages.

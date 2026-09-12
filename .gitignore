@@ -1,4 +1,5 @@
 build
+/benchmark-results/
 .venv
 .cache
 .idea
