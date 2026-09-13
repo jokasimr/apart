@@ -81,6 +81,8 @@ SELECT decision_tree(example_tree(), [x, y]::FLOAT[2]) AS result
 FROM measurements;
 ```
 
+See [Piecewise lookups](examples/piecewise.md) for examples using sorted ranges.
+
 The computation type is selected from all weights, thresholds, and features: if any is `DOUBLE`, use `DOUBLE`; otherwise, if any is `FLOAT`, use `FLOAT`; otherwise, use `DOUBLE`. Feature conversions follow DuckDB's implicit casting rules. These conversions can lose precision. If any feature is `NULL`, the result is `NULL`.
 
 
