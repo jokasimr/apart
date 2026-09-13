@@ -2,6 +2,15 @@
 
 `apart` is a DuckDB extension for evaluating affine, or oblique, decision trees directly in SQL. It aims to do so efficiently both for deep and shallow trees and for decisions involving few or many variables.
 
+## Why?
+
+Many problems can be modeled by piecewise constant functions where the constant regions are separated by flat boundaries.
+Evaluating these functions, finding which region each point belongs to, can be difficult to do efficiently in SQL.
+
+The evaluation of such functions can be represented as affine decision trees, and `apart` lets you evaluate those directly in DuckDB.
+
+For some example use cases, see [examples](examples/README.md).
+
 ## Usage
 
 The extension provides two forms of the `decision_tree` scalar function:
@@ -82,8 +91,6 @@ FROM measurements;
 ```
 
 The computation type is selected from all weights, thresholds, and features: if any is `DOUBLE`, use `DOUBLE`; otherwise, if any is `FLOAT`, use `FLOAT`; otherwise, use `DOUBLE`. Feature conversions follow DuckDB's implicit casting rules. These conversions can lose precision. If any feature is `NULL`, the result is `NULL`.
-
-See [example use cases](examples/README.md).
 
 
 ## Fixed depth (optional optimization)
