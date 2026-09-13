@@ -1,0 +1,40 @@
+{
+  "seed": 20260912,
+  "cells": 1000,
+  "domain": {
+    "x": [
+      0,
+      12.0
+    ],
+    "y": [
+      0,
+      8.0
+    ]
+  },
+  "coordinate_system": "unitless Cartesian; not geographic longitude/latitude",
+  "internal_nodes": 4090,
+  "distinct_leaf_values": 1001,
+  "interior_leaf_occurrences": 4087,
+  "min_interior_decisions": 13,
+  "max_interior_decisions": 18,
+  "mean_decisions_uniform_domain": 16.225580715856164,
+  "outside_value": null,
+  "boundary_rule": "Closed domain; shared edges follow the >= branch in double precision.",
+  "construction": {
+    "algorithm": "greedy BSP with balanced, fragmentation-aware splits",
+    "attempts": [
+      {
+        "attempt": 1,
+        "fragmentation_penalty": 1.0,
+        "spatial_depth": 14,
+        "spatial_internal_nodes": 4086,
+        "seconds": 2.020069272010005
+      }
+    ],
+    "selected_attempt": 1,
+    "selection": "minimum maximum depth, then node count",
+    "build_seconds": 2.0612380480015418
+  },
+  "geometry": "clipped Voronoi cells of the stored generating sites",
+  "coefficient_format": "DOUBLE coefficients in tree.json and grid.sql"
+}

@@ -1,0 +1,82 @@
+{
+  "rows": 1000000,
+  "warmups": 2,
+  "repeats": 5,
+  "threads": 1,
+  "distribution": "unsorted uniform points in [0,12) x [0,8)",
+  "duckdb_version": "v1.5.4 (Variegata) 08e34c447b",
+  "tree_sha256": "a189207a16897b0c9def6032418b5849464bd1b29e0228d6988f14d9b8476554",
+  "apart_sha256": "fc0d377cfc5cda0179025bb9a00aa7c7e3ffcf99af269cf4649b878e2df2ab3e",
+  "spatial_sha256": "819a0fa94d2e8257371bb4d97f32c47586b42c85e24bab1bcbf8712a88b8ccfa",
+  "queries": {
+    "apart": "SELECT sum(locate_cell(x,y))::HUGEINT FROM points",
+    "case": "SELECT sum(locate_cell_sql(x,y))::HUGEINT FROM points",
+    "spatial": "SELECT sum(cell_id)::HUGEINT FROM locate_cells_spatial('points')"
+  },
+  "checksums": {
+    "apart": [
+      "495604100"
+    ],
+    "case": [
+      "495604100"
+    ],
+    "spatial": [
+      "495604100"
+    ]
+  },
+  "comparisons": {
+    "case_differences": 0,
+    "spatial_differences": 0,
+    "spatial_rows": 1000000
+  },
+  "operators": {
+    "apart": [
+      "EXECUTE",
+      "PROJECTION",
+      "SEQ_SCAN",
+      "UNGROUPED_AGGREGATE"
+    ],
+    "case": [
+      "EXECUTE",
+      "PROJECTION",
+      "SEQ_SCAN",
+      "UNGROUPED_AGGREGATE"
+    ],
+    "spatial": [
+      "EXECUTE",
+      "PROJECTION",
+      "SEQ_SCAN",
+      "SPATIAL_JOIN",
+      "UNGROUPED_AGGREGATE"
+    ]
+  },
+  "samples_ns_per_row": {
+    "apart": [
+      35.714325,
+      36.288033,
+      34.732182,
+      42.844029,
+      35.411841
+    ],
+    "case": [
+      6196.655317,
+      5955.721382,
+      6063.516687,
+      6297.612902,
+      6737.0752
+    ],
+    "spatial": [
+      2069.925197,
+      2122.9999190000003,
+      2131.20866,
+      2098.5969299999997,
+      2312.020739
+    ]
+  },
+  "median_ns_per_row": {
+    "apart": 35.714325,
+    "case": 6196.655317,
+    "spatial": 2122.9999190000003
+  },
+  "notes": "Full prepared-query wall time, including scan and sum. Loading and preparation excluded. Spatial join includes its temporary index construction. All queries start from x,y. Execution order varies between runs."
+}
