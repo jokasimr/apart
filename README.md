@@ -8,7 +8,7 @@ The extension provides two forms of the `decision_tree` scalar function:
 
 ```sql
 decision_tree(tree, x1, x2, ..., xn) -> T
-decision_tree(tree, features)         -> T
+decision_tree(tree, features) -> T
 ```
 
 The first form accepts one or more feature arguments. The second accepts a fixed-size DuckDB `ARRAY`. Feature values may be integers, decimals, `FLOAT`, or `DOUBLE`.
