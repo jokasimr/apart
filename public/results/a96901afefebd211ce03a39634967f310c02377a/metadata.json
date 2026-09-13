@@ -1,0 +1,65 @@
+{
+  "baseline_revision": "ee342ee948f5bbe6a27dff7a56a158e50e8abc9a",
+  "cpu": 0,
+  "depths": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "duckdb_version": "v1.5.4 (Variegata) 08e34c447b",
+  "feature_counts": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    20,
+    100
+  ],
+  "generated_at": "2026-09-13T13:49:27.430886+00:00",
+  "host": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "measurement_order": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline"
+  ],
+  "repository": "jokasimr/apart",
+  "revision": "a96901afefebd211ce03a39634967f310c02377a",
+  "row_count_summary": "20,000,000 for 1, 2, 3, 4, 5; 10,000,000 for 6, 7, 8, 9, 10; 4,000,000 for 20; 700,000 for 100",
+  "row_counts": {
+    "1": 20000000,
+    "2": 20000000,
+    "3": 20000000,
+    "4": 20000000,
+    "5": 20000000,
+    "6": 10000000,
+    "7": 10000000,
+    "8": 10000000,
+    "9": 10000000,
+    "10": 10000000,
+    "20": 4000000,
+    "100": 700000
+  },
+  "run_url": "https://github.com/jokasimr/apart/actions/runs/34760179444",
+  "runs": 7,
+  "schema_version": 2,
+  "seed": 20260912,
+  "tree_definitions": {
+    "fixed": "all paths have depth D",
+    "variable": "approximately half the rows stop at depth D-1 and half at depth D"
+  },
+  "warmups": 2
+}
