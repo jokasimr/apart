@@ -1,0 +1,83 @@
+# name: test/sql/null_tree.test
+# description: NULL trees propagate NULL while preserving the leaf result type
+# group: [sql]
+
+require apart
+
+statement ok
+PRAGMA verify_serializer
+
+# Untyped NULL trees work with scalar features and fixed-size arrays.
+query III
+SELECT decision_tree(NULL, 1),
+       decision_tree(NULL, 1, 2),
+       decision_tree(NULL, [1, 2]::INTEGER[2]);
+----
+NULL	NULL	NULL
+
+query I
+SELECT count(*)
+FROM range(4096) rows(i)
+WHERE decision_tree(NULL, i) IS NULL
+  AND decision_tree(NULL, [i]::BIGINT[1]) IS NULL;
+----
+4096
+
+statement ok
+CREATE MACRO null_test_tree(leaves) AS {
+    weights: [[1]], thresholds: [0], children: [[-1, -1]], values: leaves
+};
+
+# NULL STRUCTs retain the type of their LIST or ARRAY leaf values, including
+# nested result types. NULLIF also checks trees computed by constant expressions.
+foreach leaves [42] ['leaf'] [[1,2]] [{'a':42}] array_value(42) array_value([1,2]::INTEGER[2])
+
+query IIII
+SELECT decision_tree(NULLIF(null_test_tree(${leaves}), null_test_tree(${leaves})), 1) IS NULL,
+       decision_tree(NULLIF(null_test_tree(${leaves}), null_test_tree(${leaves})), [1]::INTEGER[1]) IS NULL,
+       typeof(decision_tree(NULLIF(null_test_tree(${leaves}), null_test_tree(${leaves})), 1))
+           = typeof((${leaves})[1]),
+       typeof(decision_tree(NULLIF(null_test_tree(${leaves}), null_test_tree(${leaves})), [1]::INTEGER[1]))
+           = typeof((${leaves})[1]);
+----
+true	true	true	true
+
+endloop
+
+# Literal typed NULLs also preserve the result type with nonconstant features.
+query IT
+SELECT count(*), min(typeof(result))
+FROM (
+    SELECT decision_tree(
+        NULL::STRUCT(weights INTEGER[][], thresholds INTEGER[], children INTEGER[][], "values" VARCHAR[]),
+        i
+    ) AS result
+    FROM range(4096) rows(i)
+) results
+WHERE result IS NULL;
+----
+4096	VARCHAR
+
+# Prepared statements rebind when the tree changes between NULL and non-NULL.
+statement ok
+PREPARE nullable_tree AS SELECT decision_tree($1, 1);
+
+query I
+EXECUTE nullable_tree(NULL);
+----
+NULL
+
+query I
+EXECUTE nullable_tree(null_test_tree([42]));
+----
+42
+
+query T
+EXECUTE nullable_tree(NULLIF(null_test_tree(['leaf']), null_test_tree(['leaf'])));
+----
+NULL
+
+query T
+EXECUTE nullable_tree(null_test_tree(['leaf']));
+----
+leaf

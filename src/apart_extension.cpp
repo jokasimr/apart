@@ -9,6 +9,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -1520,6 +1521,11 @@ static LogicalType ConfigureTypes(ClientContext &context, ScalarFunction &functi
 	return computation_type;
 }
 
+static unique_ptr<Expression> BindNullDecisionTreeExpression(FunctionBindExpressionInput &input) {
+	auto &bind_data = input.bind_data->Cast<VariableReturnBindData>();
+	return make_uniq<BoundConstantExpression>(Value(bind_data.stype));
+}
+
 static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarFunction &function,
                                                  vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() < 2) {
@@ -1533,13 +1539,32 @@ static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarF
 		throw BinderException("decision_tree tree must be a constant expression that can be evaluated before reading "
 		                      "rows; table columns and subqueries are not supported");
 	}
-	if (arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
+	auto &tree_type = arguments[0]->return_type;
+	if (tree_type.id() != LogicalTypeId::STRUCT && tree_type.id() != LogicalTypeId::SQLNULL) {
 		throw BinderException("decision_tree tree must be a STRUCT with fields weights, thresholds, children, and "
 		                      "values; got %s",
 		                      arguments[0]->return_type.ToString());
 	}
 
 	auto tree_value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+	if (tree_value.IsNull()) {
+		// A typed NULL tree still determines the leaf type, but has no nodes to compile.
+		function.return_type = LogicalType::SQLNULL;
+		if (tree_type.id() == LogicalTypeId::STRUCT) {
+			auto &fields = StructType::GetChildTypes(tree_type);
+			auto &values_type = fields[RequireStructField(fields, "values", "tree")].second;
+			if (values_type.id() == LogicalTypeId::LIST) {
+				function.return_type = ListType::GetChildType(values_type);
+			} else if (values_type.id() == LogicalTypeId::ARRAY) {
+				function.return_type = ArrayType::GetChildType(values_type);
+			} else {
+				throw BinderException("tree.values must be a list or array; got %s", values_type.ToString());
+			}
+		}
+		// Replace the whole invocation during binding, including nonconstant feature inputs.
+		function.SetBindExpressionCallback(BindNullDecisionTreeExpression);
+		return make_uniq<VariableReturnBindData>(function.return_type);
+	}
 	auto parsed_tree = ParseTreeValue(tree_value);
 	if (arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::LIST) {
 		throw BinderException(
