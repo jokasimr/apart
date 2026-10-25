@@ -1,0 +1,61 @@
+# name: test/sql/vector_lifetime.test
+# description: dictionary leaves, nested NULLs, and retained results across batches
+# group: [sql]
+
+require apart
+
+statement ok
+SET debug_verify_serializer = true;
+
+statement ok
+SET debug_verification_mode = 'verify_vectors';
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE MACRO lifetime_tree(leaves) AS {
+    weights: [[1]], thresholds: [0], children: [[-2, -1]], values: leaves
+};
+
+# Consecutive batches include NULL-only and valid-only runs. The two string
+# trees must have independent dictionary identities, including through copies
+# of bind data, parallel execution, and materialization.
+statement ok
+CREATE TABLE retained_leaves AS
+SELECT i, x,
+    decision_tree(lifetime_tree(['below-long-string', 'above-long-string']), x) AS s,
+    decision_tree(lifetime_tree(['different-below', 'different-above']), x) AS other_s,
+    decision_tree(lifetime_tree([[1, NULL, 3], [4, 5, 6]]), x) AS l,
+    decision_tree(lifetime_tree([[1, NULL, 3]::INTEGER[3], [4, 5, 6]::INTEGER[3]]), x) AS a,
+    decision_tree(lifetime_tree([
+        NULL::STRUCT(s VARCHAR, v INTEGER),
+        {s: 'nested-long-string', v: NULL::INTEGER}
+    ]), x) AS nested
+FROM (
+    SELECT i, CASE WHEN i % 8192 < 2048 THEN NULL ELSE (i % 257 - 128)::DOUBLE END AS x
+    FROM range(100000) inputs(i)
+) inputs;
+
+query I
+SELECT count(*) FROM retained_leaves
+WHERE s IS DISTINCT FROM CASE WHEN x IS NULL THEN NULL WHEN x >= 0 THEN 'above-long-string' ELSE 'below-long-string' END
+   OR other_s IS DISTINCT FROM CASE WHEN x IS NULL THEN NULL WHEN x >= 0 THEN 'different-above' ELSE 'different-below' END
+   OR l IS DISTINCT FROM CASE WHEN x IS NULL THEN NULL WHEN x >= 0 THEN [4, 5, 6] ELSE [1, NULL, 3] END
+   OR a IS DISTINCT FROM (CASE WHEN x IS NULL THEN NULL WHEN x >= 0 THEN [4, 5, 6] ELSE [1, NULL, 3] END)::INTEGER[3]
+   OR nested IS DISTINCT FROM CASE WHEN x >= 0 THEN {s: 'nested-long-string', v: NULL::INTEGER} ELSE NULL END;
+----
+0
+
+# Exercise downstream dictionary caching as well as retained copies of leaves.
+query I
+SELECT count(*) FROM (
+    SELECT i, upper(decision_tree(lifetime_tree(['below-long-string', 'above-long-string']), x)) AS s
+    FROM retained_leaves
+) actual JOIN retained_leaves expected USING (i)
+WHERE actual.s IS DISTINCT FROM upper(expected.s);
+----
+0
+
+statement ok
+RESET debug_verification_mode;

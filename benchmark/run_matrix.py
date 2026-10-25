@@ -163,9 +163,9 @@ def build_sql(
         ".mode csv",
         ".headers off",
         ".echo off",
-        "PRAGMA threads=1;",
-        "PRAGMA preserve_insertion_order=false;",
-        "PRAGMA disable_progress_bar;",
+        "SET threads=1;",
+        "SET preserve_insertion_order=false;",
+        "SET enable_progress_bar=false;",
     ]
     feature_tables = {}
     row_groups = group_row_counts(row_counts, feature_counts)
@@ -187,7 +187,7 @@ def build_sql(
 
     executions: list[tuple[str, Case, str, int]] = []
     order_rng = random.Random(seed ^ 0xA17E)
-    lines.append("PRAGMA enable_profiling='json';")
+    lines.append("SET enable_profiling='json';")
     for phase, round_count in (("warmup", warmups), ("measured", runs)):
         for _ in range(round_count):
             order = list(cases)
@@ -219,7 +219,7 @@ def median_absolute_deviation(values: list[float]) -> float:
 
 
 def binary_version(binary: Path) -> str:
-    result = subprocess.run([str(binary), "-version"], text=True, capture_output=True, check=True)
+    result = subprocess.run([str(binary), "-no-agent", "-version"], text=True, capture_output=True, check=True)
     return result.stdout.strip()
 
 
@@ -231,7 +231,7 @@ def run_extension(
     cpu: int | None,
     timeout: int,
 ) -> list[dict]:
-    command = [str(binary), "-unsigned", "-batch"]
+    command = [str(binary), "-no-agent", "-unsigned", "-batch"]
     if cpu is not None and shutil.which("taskset"):
         command = ["taskset", "-c", str(cpu), *command]
     extension_path = str(extension.resolve()).replace("'", "''")
@@ -260,13 +260,13 @@ def run_extension(
     case_rows = {execution[1].key: execution[3] for execution in executions}
     for execution, profile, output in zip(executions, profiles, output_rows):
         phase, case, query, row_count = execution
-        if profile["query_name"] != query:
-            raise RuntimeError(f"profile mismatch: expected {query!r}, got {profile['query_name']!r}")
+        if profile["query"]["sql"] != query:
+            raise RuntimeError(f"profile mismatch: expected {query!r}, got {profile['query']['sql']!r}")
         if len(output) != 1:
             raise RuntimeError(f"unexpected output for {query}: {output!r}")
         checksums.setdefault(case.key, set()).add(output[0])
         if phase == "measured":
-            samples.setdefault(case.key, []).append(profile["cpu_time"] * 1e9 / row_count)
+            samples.setdefault(case.key, []).append(profile["query"]["cpu_time"] * 1e9 / row_count)
 
     if any(len(values) != 1 for values in checksums.values()):
         raise RuntimeError(f"a checksum changed between runs for {extension}")

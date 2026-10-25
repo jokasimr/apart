@@ -5,7 +5,7 @@
 require apart
 
 statement ok
-PRAGMA verify_serializer
+SET debug_verify_serializer = true
 
 statement ok
 CREATE MACRO one_node_tree(node_weights, node_threshold, below_value, above_value) AS {
@@ -184,13 +184,33 @@ WHERE decision_tree(generic_test_tree(), x0, x1, x2)
 ----
 0
 
+# test_vector_types does not generate ARRAYs in DuckDB 2.0. Exercise their
+# representations explicitly, including parent NULLs and NULL elements.
+foreach vector_mode none dictionary_operator constant_operator nested_shuffle
+
+statement ok
+SET debug_verify_vector = '${vector_mode}';
+
 query I
+WITH features AS (
+    SELECT CASE WHEN i % 11 = 0 THEN NULL::FLOAT[3]
+                ELSE [(i % 5 - 2)::FLOAT,
+                      CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 3 - 1)::FLOAT END,
+                      1.0::FLOAT]::FLOAT[3]
+           END AS x
+    FROM range(4096) rows(i)
+)
 SELECT count(*)
-FROM test_vector_types(NULL::FLOAT[3]) features(x)
+FROM features
 WHERE decision_tree(generic_test_tree(), x)
       IS DISTINCT FROM decision_tree(generic_test_tree(), x[1], x[2], x[3]);
 ----
 0
+
+endloop
+
+statement ok
+RESET debug_verify_vector;
 
 # Exercise the fixed-depth three-feature kernels for column and ARRAY inputs.
 statement ok

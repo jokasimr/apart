@@ -2,6 +2,8 @@
 
 `apart` is a DuckDB extension for evaluating affine, or oblique, decision trees directly in SQL. It aims to do so efficiently both for deep and shallow trees and for decisions involving few or many variables.
 
+This revision targets DuckDB 2.0.0. Building from source requires a C++17 compiler and the pinned `duckdb` and `extension-ci-tools` submodules (`git submodule update --init --recursive`).
+
 ## Why?
 
 Many problems can be modeled by piecewise constant functions where the constant regions are separated by flat boundaries.

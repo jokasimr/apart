@@ -52,7 +52,7 @@ LOAD '{apart}';
 LOAD '{spatial_path}';
 SET threads=1;
 SET preserve_insertion_order=false;
-PRAGMA disable_progress_bar;
+SET enable_progress_bar=false;
 {tree_sql}
 {case_sql(tree)}
 {join_sql}
@@ -64,7 +64,7 @@ FROM range({args.rows}) t(i);
 """
     for name, query in queries.items():
         setup += f"PREPARE lookup_{name} AS {query};\n"
-    setup += "PRAGMA enable_profiling='json';\n"
+    setup += "SET enable_profiling='json';\n"
     order = []
     for repeat in range(args.warmups + args.repeats):
         names = list(queries)
@@ -72,7 +72,7 @@ FROM range({args.rows}) t(i);
         order.extend((name, repeat >= args.warmups) for name in names)
     sql = setup + "".join(f"EXECUTE lookup_{name};\n" for name, _ in order)
     # Compare row results as part of the benchmark, outside the timed runs.
-    sql += "PRAGMA disable_profiling;\n"
+    sql += "RESET enable_profiling;\n"
     sql += """
 SELECT 'case_differences', count(*)
 FROM points WHERE locate_cell(x,y) IS DISTINCT FROM locate_cell_sql(x,y);
@@ -86,7 +86,7 @@ SELECT 'spatial_rows', count(*) FROM locate_cells_spatial('points');
     cpu = 2 if 2 in available else available[0]
     print(f"Comparing {len(queries)} queries over {args.rows:,} points...", flush=True)
     process = subprocess.run(
-        ["taskset", "-c", str(cpu), str(binary), "-unsigned", "-batch"],
+        ["taskset", "-c", str(cpu), str(binary), "-no-agent", "-unsigned", "-batch"],
         input=sql, text=True, capture_output=True, cwd=ROOT, timeout=600,
     )
     prefix.with_suffix(".stdout").write_text(process.stdout)
@@ -102,14 +102,14 @@ SELECT 'spatial_rows', count(*) FROM locate_cells_spatial('points');
     operators = {}
     for (name, measured), profile, row in zip(order, profiles, output):
         checksums[name].add(row[0])
-        operators[name] = sorted({n.get("operator_name", "").strip() for n in walk(profile)} - {""})
+        operators[name] = sorted({n.get("type", "").strip() for root in profile["operator"] for n in walk(root)} - {""})
         if measured:
-            samples[name].append(profile["latency"] * 1e9 / args.rows)
+            samples[name].append(profile["query"]["total_time"] * 1e9 / args.rows)
     comparisons = {row[0]: int(row[1]) for row in output[len(order):]}
     result = {
         "rows": args.rows, "warmups": args.warmups, "repeats": args.repeats,
         "threads": 1, "distribution": "unsorted uniform points in [0,12) x [0,8)",
-        "duckdb_version": subprocess.check_output([str(binary), "-version"], text=True).strip(),
+        "duckdb_version": subprocess.check_output([str(binary), "-no-agent", "-version"], text=True).strip(),
         "tree_sha256": hashlib.sha256((DIRECTORY / "tree.json").read_bytes()).hexdigest(),
         "apart_sha256": hashlib.sha256(apart.read_bytes()).hexdigest(),
         "spatial_sha256": hashlib.sha256(args.spatial_extension.read_bytes()).hexdigest(),

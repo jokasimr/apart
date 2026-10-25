@@ -267,7 +267,7 @@ NULL
 # Valid references at both ends of the leaf range, reordered nodes, and HUGEINT
 # child references must remain accepted by both specialized and generic trees.
 statement ok
-PRAGMA verify_serializer;
+SET debug_verify_serializer = true;
 
 foreach dimensions 1 8
 

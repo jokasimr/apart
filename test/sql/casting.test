@@ -5,7 +5,75 @@
 require apart
 
 statement ok
-PRAGMA verify_serializer;
+SET debug_verify_serializer = true;
+
+# Ordered FMA preserves the negative residual in
+# -1 + (1 + epsilon) * (1 - epsilon) = -epsilon^2.
+# Every evaluator must select below, including constant folding and batch tails.
+foreach numeric_type FLOAT DOUBLE
+
+statement ok
+CREATE OR REPLACE MACRO rounding_high() AS
+    (1 + power(2.0, CASE WHEN '{numeric_type}' = 'FLOAT' THEN -23 ELSE -27 END))::{numeric_type};
+
+statement ok
+CREATE OR REPLACE MACRO rounding_low() AS
+    (1 - power(2.0, CASE WHEN '{numeric_type}' = 'FLOAT' THEN -23 ELSE -27 END))::{numeric_type};
+
+statement ok
+CREATE OR REPLACE MACRO rounding_tree(dimensions) AS {
+    weights: [list_transform(range(dimensions), lambda j:
+        CASE WHEN j = 0 THEN -1 WHEN j = 1 THEN rounding_high() ELSE 0 END)],
+    thresholds: [0::{numeric_type}], children: [[-2, -1]], values: [10, 20]
+};
+
+foreach dimensions 2 3 7 8 20
+
+query I
+WITH inputs AS (
+    SELECT list_transform(range({dimensions}), lambda j:
+        CASE WHEN j = 0 THEN 1 + i % 2 WHEN j = 1 THEN rounding_low() ELSE 0 END)::{numeric_type}[{dimensions}] AS x
+    FROM range(4097) inputs(i)
+)
+SELECT count(*) FROM inputs
+WHERE decision_tree(rounding_tree({dimensions}), x) IS DISTINCT FROM 10;
+----
+0
+
+query I
+SELECT decision_tree(rounding_tree({dimensions}),
+    list_transform(range({dimensions}), lambda j:
+        CASE WHEN j = 0 THEN 1 WHEN j = 1 THEN rounding_low() ELSE 0 END)::{numeric_type}[{dimensions}]);
+----
+10
+
+endloop
+
+query I
+SELECT count(*) FROM range(4097) inputs(i)
+WHERE decision_tree(rounding_tree(2), (1 + i % 2)::{numeric_type}, rounding_low()) IS DISTINCT FROM 10
+   OR decision_tree(rounding_tree(8), (1 + i % 2)::{numeric_type}, rounding_low(),
+       0::{numeric_type}, 0::{numeric_type}, 0::{numeric_type},
+       0::{numeric_type}, 0::{numeric_type}, 0::{numeric_type}) IS DISTINCT FROM 10;
+----
+0
+
+# Both traversal forms must use the same accumulation rule.
+statement ok
+CREATE OR REPLACE MACRO rounding_variable_tree() AS {
+    weights: [[-1::{numeric_type}, rounding_high()], [0::{numeric_type}, 0::{numeric_type}]],
+    thresholds: [0::{numeric_type}, 0::{numeric_type}],
+    children: [[2, -1], [-2, -2]], values: [10, 20]
+};
+
+query I
+SELECT count(*) FROM range(4097) inputs(i)
+WHERE decision_tree(rounding_variable_tree(), (1 + i % 2)::{numeric_type}, rounding_low()) IS DISTINCT FROM 10
+   OR decision_tree(fixed_depth(rounding_variable_tree()), (1 + i % 2)::{numeric_type}, rounding_low()) IS DISTINCT FROM 10;
+----
+0
+
+endloop
 
 statement ok
 CREATE MACRO casting_tree(w, t) AS {

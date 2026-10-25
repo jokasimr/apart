@@ -28,6 +28,8 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      DUCKDB_VERSION: v2.0.0
 
     steps:
       - name: Check out benchmark revision
@@ -65,7 +67,7 @@ jobs:
           fi
           test -n "$distribution_run_id"
           gh run download "$distribution_run_id" \
-            --name apart-v1.5.4-extension-linux_amd64 \
+            --name "apart-${DUCKDB_VERSION}-extension-linux_amd64" \
             --dir extension-candidate
 
           baseline_revision=""
@@ -82,11 +84,16 @@ jobs:
             baseline_metadata=$(find benchmark-baseline -name metadata.json -print -quit)
             baseline_extension=$(find benchmark-baseline -name apart.duckdb_extension -print -quit)
             if [ -n "$baseline_metadata" ] && [ -n "$baseline_extension" ]; then
-              # The fallback reads the existing pre-history artifact.
-              baseline_revision=$(jq -r '.revision // .current.revision // empty' "$baseline_metadata")
-              if [ -n "$baseline_revision" ]; then
-                mkdir -p extension-baseline
-                cp "$baseline_extension" extension-baseline/apart.duckdb_extension
+              baseline_duckdb_version=$(jq -r '(.duckdb_version // "") | split(" ")[0]' "$baseline_metadata")
+              if [ "$baseline_duckdb_version" = "$DUCKDB_VERSION" ]; then
+                # The fallback reads the existing pre-history artifact.
+                baseline_revision=$(jq -r '.revision // .current.revision // empty' "$baseline_metadata")
+                if [ -n "$baseline_revision" ]; then
+                  mkdir -p extension-baseline
+                  cp "$baseline_extension" extension-baseline/apart.duckdb_extension
+                fi
+              else
+                echo "Skipping baseline built for ${baseline_duckdb_version:-an unknown DuckDB version}"
               fi
             fi
           fi
@@ -96,7 +103,7 @@ jobs:
       - name: Download DuckDB
         run: |
           curl --fail --location --retry 3 \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" \
             --output duckdb.zip
           unzip -q duckdb.zip -d duckdb
 

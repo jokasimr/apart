@@ -7,13 +7,20 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
-#include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
+#include <cmath>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -45,6 +52,16 @@ struct ParsedTree {
 	LogicalType leaf_type;
 };
 
+static buffer_ptr<DictionaryEntry> CreateLeafDictionary(const Vector &values, idx_t leaf_count) {
+	if (leaf_count >= STANDARD_VECTOR_SIZE / 2 || TypeIsConstantSize(values.GetType().InternalType()) ||
+	    values.GetType().InternalType() == PhysicalType::STRUCT) {
+		return nullptr;
+	}
+	auto result = DictionaryVector::CreateReusableDictionary(values.GetType(), values.size());
+	result->data.Reference(values);
+	return result;
+}
+
 struct CompiledTree {
 	CompiledTree(const ParsedTree &tree, idx_t dimensions_p)
 	    : leaf_values(tree.leaf_type, tree.leaf_values.size() + 1), leaf_count(tree.leaf_values.size()), root(0),
@@ -53,10 +70,13 @@ struct CompiledTree {
 			leaf_values.SetValue(leaf_idx, tree.leaf_values[leaf_idx]);
 		}
 		leaf_values.SetValue(leaf_count, Value(tree.leaf_type));
+		FlatVector::SetSize(leaf_values, leaf_count + 1);
+		leaf_dictionary = CreateLeafDictionary(leaf_values, leaf_count);
 		leaf_values_all_valid = FlatVector::Validity(leaf_values).CheckAllValid(leaf_count);
 		if (tree.leaf_type.id() == LogicalTypeId::STRUCT) {
 			for (auto &child : StructVector::GetEntries(leaf_values)) {
-				struct_children_all_valid.push_back(FlatVector::Validity(*child).CheckAllValid(leaf_count));
+				struct_children_all_valid.push_back(FlatVector::Validity(child).CheckAllValid(leaf_count));
+				struct_dictionaries.push_back(CreateLeafDictionary(child, leaf_count));
 			}
 		}
 	}
@@ -72,6 +92,8 @@ struct CompiledTree {
 	uint32_t min_depth;
 	bool leaf_values_all_valid;
 	vector<bool> struct_children_all_valid;
+	buffer_ptr<DictionaryEntry> leaf_dictionary;
+	vector<buffer_ptr<DictionaryEntry>> struct_dictionaries;
 };
 
 template <class T, idx_t N>
@@ -113,12 +135,12 @@ struct GenericTree final : CompiledTree {
 };
 
 struct DecisionTreeBindData final : FunctionData {
-	DecisionTreeBindData(shared_ptr<CompiledTree> tree_p, Value tree_value_p, LogicalType computation_type_p)
+	DecisionTreeBindData(shared_ptr<const CompiledTree> tree_p, Value tree_value_p, LogicalType computation_type_p)
 	    : tree(std::move(tree_p)), tree_value(std::move(tree_value_p)),
 	      computation_type(std::move(computation_type_p)) {
 	}
 
-	shared_ptr<CompiledTree> tree;
+	shared_ptr<const CompiledTree> tree;
 	Value tree_value;
 	LogicalType computation_type;
 
@@ -129,22 +151,6 @@ struct DecisionTreeBindData final : FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DecisionTreeBindData>();
 		return computation_type == other.computation_type && tree_value == other.tree_value;
-	}
-};
-
-struct FixedDepthTreeBindData final : FunctionData {
-	explicit FixedDepthTreeBindData(Value tree_value_p) : tree_value(std::move(tree_value_p)) {
-	}
-
-	Value tree_value;
-
-	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<FixedDepthTreeBindData>(tree_value);
-	}
-
-	bool Equals(const FunctionData &other_p) const override {
-		auto &other = other_p.Cast<FixedDepthTreeBindData>();
-		return tree_value == other.tree_value;
 	}
 };
 
@@ -172,7 +178,7 @@ static const vector<Value> &SequenceValues(const Value &value, const string &pat
 
 static optional_idx FindStructField(const child_list_t<LogicalType> &fields, const string &name) {
 	for (idx_t field_idx = 0; field_idx < fields.size(); field_idx++) {
-		if (StringUtil::CIEquals(fields[field_idx].first, name)) {
+		if (fields[field_idx].first == name) {
 			return field_idx;
 		}
 	}
@@ -693,21 +699,12 @@ struct ColumnInput {
 };
 
 template <class T, idx_t N>
-struct FixedArrayInput {
-	const T *data;
-
-	inline T Get(idx_t feature, idx_t row) const {
-		return data[row * N + feature];
-	}
-};
-
-template <class T>
-struct GenericArrayInput {
+struct ArrayInput {
 	const T *data;
 	idx_t dimensions;
 
 	inline T Get(idx_t feature, idx_t row) const {
-		return data[row * dimensions + feature];
+		return data[row * (N == 0 ? dimensions : N) + feature];
 	}
 };
 
@@ -725,7 +722,7 @@ template <idx_t FEATURE, class T, idx_t N, class INPUT>
 struct FixedScore {
 	template <class NODE>
 	static inline void Accumulate(T &score, const NODE &node, const INPUT &input, idx_t row) {
-		score += node.coefficients[FEATURE] * input.Get(FEATURE, row);
+		score = std::fma(node.coefficients[FEATURE], input.Get(FEATURE, row), score);
 		FixedScore<FEATURE + 1, T, N, INPUT>::Accumulate(score, node, input, row);
 	}
 };
@@ -900,11 +897,10 @@ static inline void UpdateGenericLane(const T *coefficients, const INPUT &input, 
                                      T (&scores)[BLOCK_SIZE]) {
 	constexpr auto lane_bit = static_cast<uint8_t>(uint8_t(1) << LANE);
 	if (!CHECK_ACTIVE || (active & lane_bit)) {
-		auto product = coefficients[references[LANE]] * input.Get(feature, row + LANE);
-		if (INITIALIZE) {
-			scores[LANE] = product;
+		if constexpr (INITIALIZE) {
+			scores[LANE] = coefficients[references[LANE]] * input.Get(feature, row + LANE);
 		} else {
-			scores[LANE] += product;
+			scores[LANE] = std::fma(coefficients[references[LANE]], input.Get(feature, row + LANE), scores[LANE]);
 		}
 	}
 }
@@ -967,7 +963,7 @@ static inline uint32_t TraverseGeneric(const GenericTree<T> &tree, const INPUT &
 		D_ASSERT(reference < node_count);
 		T score = coefficients[reference] * input.Get(0, row);
 		for (idx_t feature = 1; feature < tree.dimensions; feature++) {
-			score += coefficients[feature * node_count + reference] * input.Get(feature, row);
+			score = std::fma(coefficients[feature * node_count + reference], input.Get(feature, row), score);
 		}
 		auto &node = nodes[reference];
 		reference = node.children[static_cast<idx_t>(score >= node.threshold)];
@@ -1009,22 +1005,19 @@ static void EvaluateGenericTree(const GenericTree<T> &tree, const INPUT &input, 
 }
 
 template <class T, idx_t N>
-struct FixedTreeEvaluator {
-	const FixedTree<T, N> &tree;
+using TreeType = typename std::conditional<N == 0, GenericTree<T>, FixedTree<T, N>>::type;
+
+template <class T, idx_t N>
+struct TreeEvaluator {
+	const TreeType<T, N> &tree;
 
 	template <class INPUT>
 	void operator()(const INPUT &input, idx_t count, sel_t *leaf_indices) const {
-		EvaluateFixedTree(tree, input, count, leaf_indices);
-	}
-};
-
-template <class T>
-struct GenericTreeEvaluator {
-	const GenericTree<T> &tree;
-
-	template <class INPUT>
-	void operator()(const INPUT &input, idx_t count, sel_t *leaf_indices) const {
-		EvaluateGenericTree(tree, input, count, leaf_indices);
+		if constexpr (N == 0) {
+			EvaluateGenericTree(tree, input, count, leaf_indices);
+		} else {
+			EvaluateFixedTree(tree, input, count, leaf_indices);
+		}
 	}
 };
 
@@ -1102,15 +1095,11 @@ static DecisionTreeLocalState<T> &GetLocalState(ExpressionState &state) {
 
 static const CompiledTree &GetTree(ExpressionState &state) {
 	auto &expression = state.expr.Cast<BoundFunctionExpression>();
-	return *expression.bind_info->Cast<DecisionTreeBindData>().tree;
+	return *expression.BindInfo()->Cast<DecisionTreeBindData>().tree;
 }
 
 static bool IsSimpleLeafType(const LogicalType &type) {
 	return TypeIsConstantSize(type.InternalType());
-}
-
-static bool UseDictionary(const CompiledTree &tree, const LogicalType &type) {
-	return tree.leaf_count < STANDARD_VECTOR_SIZE / 2 && !IsSimpleLeafType(type);
 }
 
 static void CopyValidity(const Vector &source, Vector &target, const SelectionVector &selection, idx_t count,
@@ -1118,18 +1107,29 @@ static void CopyValidity(const Vector &source, Vector &target, const SelectionVe
 	if (values_all_valid && !selected_null) {
 		return;
 	}
-	FlatVector::Validity(target).CopySel(FlatVector::Validity(source), selection, 0, 0, count);
+	FlatVector::ValidityMutable(target).CopySel(FlatVector::Validity(source), selection, 0, 0, count);
 }
 
 template <class T>
 static void CopySimpleValues(const Vector &source, Vector &target, const SelectionVector &selection, idx_t count,
                              bool values_all_valid, bool selected_null) {
 	auto source_data = FlatVector::GetData<T>(source);
-	auto target_data = FlatVector::GetData<T>(target);
-	for (idx_t row = 0; row < count; row++) {
-		target_data[row] = source_data[selection.get_index(row)];
+	auto writer = FlatVector::Writer<T>(target, count);
+	if (values_all_valid && !selected_null) {
+		for (idx_t row = 0; row < count; row++) {
+			writer.WriteValue(source_data[selection.get_index(row)]);
+		}
+	} else {
+		auto &validity = FlatVector::Validity(source);
+		for (idx_t row = 0; row < count; row++) {
+			auto leaf = selection.get_index(row);
+			if (validity.RowIsValid(leaf)) {
+				writer.WriteValue(source_data[leaf]);
+			} else {
+				writer.WriteNull();
+			}
+		}
 	}
-	CopyValidity(source, target, selection, count, values_all_valid, selected_null);
 }
 
 static void CopySimpleValues(const Vector &source, Vector &target, const SelectionVector &selection, idx_t count,
@@ -1174,24 +1174,24 @@ static void EmitStruct(const CompiledTree &tree, const SelectionVector &leaf_ind
 	auto &source = StructVector::GetEntries(tree.leaf_values);
 	auto &target = StructVector::GetEntries(result);
 	for (idx_t field = 0; field < source.size(); field++) {
-		if (UseDictionary(tree, source[field]->GetType())) {
-			target[field]->Reference(*source[field]);
-			target[field]->Dictionary(tree.leaf_count + 1, leaf_indices, count);
-		} else if (IsSimpleLeafType(source[field]->GetType())) {
-			CopySimpleValues(*source[field], *target[field], leaf_indices, count, tree.struct_children_all_valid[field],
+		if (tree.struct_dictionaries[field]) {
+			target[field].Dictionary(tree.struct_dictionaries[field], leaf_indices, count);
+		} else if (IsSimpleLeafType(source[field].GetType())) {
+			CopySimpleValues(source[field], target[field], leaf_indices, count, tree.struct_children_all_valid[field],
 			                 selected_null);
 		} else {
-			target[field]->SetVectorType(VectorType::FLAT_VECTOR);
-			VectorOperations::Copy(*source[field], *target[field], leaf_indices, tree.leaf_count + 1, 0, 0, count);
+			target[field].SetVectorType(VectorType::FLAT_VECTOR);
+			target[field].Copy(source[field], leaf_indices, tree.leaf_count + 1, 0, 0, count);
 		}
 	}
 }
 
 static void EmitLeaves(const CompiledTree &tree, const SelectionVector &leaf_indices, idx_t count, bool all_constant,
                        bool selected_null, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	FlatVector::SetSize(result, count);
 	if (all_constant) {
-		result.SetVectorType(VectorType::FLAT_VECTOR);
-		VectorOperations::Copy(tree.leaf_values, result, leaf_indices, tree.leaf_count + 1, 0, 0, count);
+		result.Copy(tree.leaf_values, leaf_indices, tree.leaf_count + 1, 0, 0, count);
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 		return;
 	}
@@ -1199,16 +1199,15 @@ static void EmitLeaves(const CompiledTree &tree, const SelectionVector &leaf_ind
 		EmitStruct(tree, leaf_indices, count, selected_null, result);
 		return;
 	}
-	if (UseDictionary(tree, tree.leaf_values.GetType())) {
-		result.Reference(tree.leaf_values);
-		result.Dictionary(tree.leaf_count + 1, leaf_indices, count);
+	if (tree.leaf_dictionary) {
+		result.Dictionary(tree.leaf_dictionary, leaf_indices, count);
 		return;
 	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	if (IsSimpleLeafType(tree.leaf_values.GetType())) {
 		CopySimpleValues(tree.leaf_values, result, leaf_indices, count, tree.leaf_values_all_valid, selected_null);
 	} else {
-		VectorOperations::Copy(tree.leaf_values, result, leaf_indices, tree.leaf_count + 1, 0, 0, count);
+		result.Copy(tree.leaf_values, leaf_indices, tree.leaf_count + 1, 0, 0, count);
 	}
 }
 
@@ -1246,9 +1245,8 @@ static bool ArrayRowIsValid(const ValidityMask &array_validity, const ValidityMa
 	return true;
 }
 
-static void SetConstantNull(Vector &result) {
-	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	ConstantVector::SetNull(result, true);
+static void SetConstantNull(Vector &result, idx_t count) {
+	ConstantVector::SetNull(result, count_t(count));
 }
 
 static bool HasConstantNull(const DataChunk &args) {
@@ -1261,86 +1259,12 @@ static bool HasConstantNull(const DataChunk &args) {
 }
 
 template <class T, idx_t N>
-static void ExecuteFixedColumns(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &tree = static_cast<const FixedTree<T, N> &>(GetTree(state));
-	auto &local_state = GetLocalState<T>(state);
-	D_ASSERT(args.ColumnCount() == N);
-	if (HasConstantNull(args)) {
-		SetConstantNull(result);
-		return;
-	}
-	auto all_constant = args.AllConstant();
-	auto count = all_constant ? idx_t(1) : args.size();
-	for (idx_t feature = 0; feature < N; feature++) {
-		auto &input = args.data[feature];
-		if (input.GetVectorType() != VectorType::FLAT_VECTOR) {
-			input.Flatten(count);
-		}
-		local_state.features[feature] = FlatVector::GetData<T>(input);
-	}
-
-	ColumnInput<T> input {local_state.features.data()};
-	bool selected_null = false;
-	if (ColumnsAllValid(args, count)) {
-		EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
-	} else {
-		selected_null = true;
-		EvaluateValidityEntries<T>(
-		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
-		    [&](idx_t entry_idx) { return ColumnValidityEntry(args, entry_idx); }, FixedTreeEvaluator<T, N> {tree});
-	}
-	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
-}
-
-template <class T, idx_t N>
-static void ExecuteFixedArray(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &tree = static_cast<const FixedTree<T, N> &>(GetTree(state));
-	auto &local_state = GetLocalState<T>(state);
-	D_ASSERT(args.ColumnCount() == 1);
-	auto &arrays = args.data[0];
-	auto all_constant = arrays.GetVectorType() == VectorType::CONSTANT_VECTOR;
-	if (all_constant && ConstantVector::IsNull(arrays)) {
-		SetConstantNull(result);
-		return;
-	}
-	auto count = all_constant ? idx_t(1) : args.size();
-	if (arrays.GetVectorType() != VectorType::FLAT_VECTOR) {
-		arrays.Flatten(count);
-	}
-	auto &elements = ArrayVector::GetEntry(arrays);
-	if (elements.GetVectorType() != VectorType::FLAT_VECTOR) {
-		elements.Flatten(count * N);
-	}
-
-	FixedArrayInput<T, N> input {FlatVector::GetData<T>(elements)};
-	auto &array_validity = FlatVector::Validity(arrays);
-	auto &element_validity = FlatVector::Validity(elements);
-	auto elements_all_valid = element_validity.CheckAllValid(count * N);
-	auto all_valid = array_validity.CheckAllValid(count) && elements_all_valid;
-	if (all_constant && !all_valid) {
-		SetConstantNull(result);
-		return;
-	}
-	bool selected_null = false;
-	if (all_valid) {
-		EvaluateFixedTree(tree, input, count, local_state.leaf_indices.data());
-	} else {
-		selected_null = true;
-		EvaluateValidRuns<T>(
-		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
-		    [&](idx_t row) { return ArrayRowIsValid(array_validity, element_validity, elements_all_valid, N, row); },
-		    FixedTreeEvaluator<T, N> {tree});
-	}
-	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
-}
-
-template <class T>
-static void ExecuteGenericColumns(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &tree = static_cast<const GenericTree<T> &>(GetTree(state));
+static void ExecuteColumns(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &tree = static_cast<const TreeType<T, N> &>(GetTree(state));
 	auto &local_state = GetLocalState<T>(state);
 	D_ASSERT(args.ColumnCount() == tree.dimensions);
 	if (HasConstantNull(args)) {
-		SetConstantNull(result);
+		SetConstantNull(result, args.size());
 		return;
 	}
 	auto all_constant = args.AllConstant();
@@ -1348,7 +1272,7 @@ static void ExecuteGenericColumns(DataChunk &args, ExpressionState &state, Vecto
 	for (idx_t feature = 0; feature < tree.dimensions; feature++) {
 		auto &input = args.data[feature];
 		if (input.GetVectorType() != VectorType::FLAT_VECTOR) {
-			input.Flatten(count);
+			input.Flatten();
 		}
 		local_state.features[feature] = FlatVector::GetData<T>(input);
 	}
@@ -1356,48 +1280,48 @@ static void ExecuteGenericColumns(DataChunk &args, ExpressionState &state, Vecto
 	ColumnInput<T> input {local_state.features.data()};
 	bool selected_null = false;
 	if (ColumnsAllValid(args, count)) {
-		EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
+		TreeEvaluator<T, N> {tree}(input, count, local_state.leaf_indices.data());
 	} else {
 		selected_null = true;
 		EvaluateValidityEntries<T>(
 		    input, count, tree.leaf_count, local_state.leaf_indices.data(),
-		    [&](idx_t entry_idx) { return ColumnValidityEntry(args, entry_idx); }, GenericTreeEvaluator<T> {tree});
+		    [&](idx_t entry_idx) { return ColumnValidityEntry(args, entry_idx); }, TreeEvaluator<T, N> {tree});
 	}
 	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
 
-template <class T>
-static void ExecuteGenericArray(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &tree = static_cast<const GenericTree<T> &>(GetTree(state));
+template <class T, idx_t N>
+static void ExecuteArray(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &tree = static_cast<const TreeType<T, N> &>(GetTree(state));
 	auto &local_state = GetLocalState<T>(state);
 	D_ASSERT(args.ColumnCount() == 1);
 	auto &arrays = args.data[0];
 	auto all_constant = arrays.GetVectorType() == VectorType::CONSTANT_VECTOR;
 	if (all_constant && ConstantVector::IsNull(arrays)) {
-		SetConstantNull(result);
+		SetConstantNull(result, args.size());
 		return;
 	}
 	auto count = all_constant ? idx_t(1) : args.size();
 	if (arrays.GetVectorType() != VectorType::FLAT_VECTOR) {
-		arrays.Flatten(count);
+		arrays.Flatten();
 	}
-	auto &elements = ArrayVector::GetEntry(arrays);
+	auto &elements = ArrayVector::GetChild(arrays);
 	if (elements.GetVectorType() != VectorType::FLAT_VECTOR) {
-		elements.Flatten(count * tree.dimensions);
+		elements.Flatten();
 	}
 
-	GenericArrayInput<T> input {FlatVector::GetData<T>(elements), tree.dimensions};
+	ArrayInput<T, N> input {FlatVector::GetData<T>(elements), tree.dimensions};
 	auto &array_validity = FlatVector::Validity(arrays);
 	auto &element_validity = FlatVector::Validity(elements);
 	auto elements_all_valid = element_validity.CheckAllValid(count * tree.dimensions);
 	auto all_valid = array_validity.CheckAllValid(count) && elements_all_valid;
 	if (all_constant && !all_valid) {
-		SetConstantNull(result);
+		SetConstantNull(result, args.size());
 		return;
 	}
 	bool selected_null = false;
 	if (all_valid) {
-		EvaluateGenericTree(tree, input, count, local_state.leaf_indices.data());
+		TreeEvaluator<T, N> {tree}(input, count, local_state.leaf_indices.data());
 	} else {
 		selected_null = true;
 		EvaluateValidRuns<T>(
@@ -1405,7 +1329,7 @@ static void ExecuteGenericArray(DataChunk &args, ExpressionState &state, Vector 
 		    [&](idx_t row) {
 			    return ArrayRowIsValid(array_validity, element_validity, elements_all_valid, tree.dimensions, row);
 		    },
-		    GenericTreeEvaluator<T> {tree});
+		    TreeEvaluator<T, N> {tree});
 	}
 	EmitLeaves(tree, local_state.leaf_indices, count, all_constant, selected_null, result);
 }
@@ -1418,68 +1342,36 @@ static unique_ptr<FunctionLocalState> InitializeLocalState(ExpressionState &, co
 	return make_uniq<DecisionTreeLocalState<T>>(tree.dimensions);
 }
 
-template <class T>
-static void ConfigureFunction(ScalarFunction &function, idx_t dimensions, bool array_input) {
-	function.SetInitStateCallback(InitializeLocalState<T>);
-	if (array_input) {
-		switch (dimensions) {
-		case 1:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 1>);
-			return;
-		case 2:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 2>);
-			return;
-		case 3:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 3>);
-			return;
-		case 4:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 4>);
-			return;
-		case 5:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 5>);
-			return;
-		case 6:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 6>);
-			return;
-		case 7:
-			function.SetFunctionCallback(ExecuteFixedArray<T, 7>);
-			return;
-		default:
-			function.SetFunctionCallback(ExecuteGenericArray<T>);
-			return;
-		}
-	}
+template <class T, idx_t N>
+static void ConfigureEvaluator(BoundScalarFunction &function, bool array_input) {
+	function.SetFunctionCallback(array_input ? ExecuteArray<T, N> : ExecuteColumns<T, N>);
+}
 
+template <class T>
+static void ConfigureFunction(BoundScalarFunction &function, idx_t dimensions, bool array_input) {
+	function.SetInitStateCallback(InitializeLocalState<T>);
 	switch (dimensions) {
 	case 1:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 1>);
-		return;
+		return ConfigureEvaluator<T, 1>(function, array_input);
 	case 2:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 2>);
-		return;
+		return ConfigureEvaluator<T, 2>(function, array_input);
 	case 3:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 3>);
-		return;
+		return ConfigureEvaluator<T, 3>(function, array_input);
 	case 4:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 4>);
-		return;
+		return ConfigureEvaluator<T, 4>(function, array_input);
 	case 5:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 5>);
-		return;
+		return ConfigureEvaluator<T, 5>(function, array_input);
 	case 6:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 6>);
-		return;
+		return ConfigureEvaluator<T, 6>(function, array_input);
 	case 7:
-		function.SetFunctionCallback(ExecuteFixedColumns<T, 7>);
-		return;
+		return ConfigureEvaluator<T, 7>(function, array_input);
 	default:
-		function.SetFunctionCallback(ExecuteGenericColumns<T>);
-		return;
+		return ConfigureEvaluator<T, 0>(function, array_input);
 	}
 }
 
-static LogicalType ConfigureTypes(ClientContext &context, ScalarFunction &function, const ParsedTree &tree,
-                                  idx_t dimensions, bool array_input, const vector<LogicalType> &feature_types) {
+static LogicalType ResolveComputationType(ClientContext &context, const ParsedTree &tree, bool array_input,
+                                          const vector<LogicalType> &feature_types) {
 	// Validation guarantees nonempty fields; LIST/ARRAY element types are uniform.
 	auto weight_type = tree.coefficients[0][0].type().id();
 	auto threshold_type = tree.thresholds[0].type().id();
@@ -1503,31 +1395,31 @@ static LogicalType ConfigureTypes(ClientContext &context, ScalarFunction &functi
 		}
 	}
 
-	function.return_type = tree.leaf_type;
-	function.varargs = LogicalType(LogicalTypeId::INVALID);
+	return computation_type;
+}
+
+static unique_ptr<FunctionData> CompileDecisionTree(BoundScalarFunction &function, const ParsedTree &parsed_tree,
+                                                    Value tree_value) {
+	auto &feature_type = function.GetArguments()[0];
+	auto array_input = function.GetArguments().size() == 1 && feature_type.id() == LogicalTypeId::ARRAY;
+	auto dimensions = array_input ? ArrayType::GetSize(feature_type) : function.GetArguments().size();
+	auto computation_type = array_input ? ArrayType::GetChildType(feature_type) : feature_type;
+	function.SetBindExpressionCallback(nullptr);
+	function.SetReturnType(parsed_tree.leaf_type);
 	function.SetNullHandling(FunctionNullHandling::DEFAULT_NULL_HANDLING);
-	if (array_input) {
-		function.arguments[0] = LogicalType::ARRAY(computation_type, dimensions);
-	} else {
-		for (auto &argument : function.arguments) {
-			argument = computation_type;
-		}
-	}
 	if (computation_type == LogicalType::DOUBLE) {
 		ConfigureFunction<double>(function, dimensions, array_input);
 	} else {
 		ConfigureFunction<float>(function, dimensions, array_input);
 	}
-	return computation_type;
+	auto compiled_tree = computation_type == LogicalType::DOUBLE ? CompileTree<double>(parsed_tree, dimensions)
+	                                                             : CompileTree<float>(parsed_tree, dimensions);
+	return make_uniq<DecisionTreeBindData>(std::move(compiled_tree), std::move(tree_value), computation_type);
 }
 
-static unique_ptr<Expression> BindNullDecisionTreeExpression(FunctionBindExpressionInput &input) {
-	auto &bind_data = input.bind_data->Cast<VariableReturnBindData>();
-	return make_uniq<BoundConstantExpression>(Value(bind_data.stype));
-}
-
-static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarFunction &function,
-                                                 vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<Expression> BindDecisionTreeExpression(FunctionBindExpressionInput &input) {
+	auto &context = input.context;
+	auto &arguments = input.children;
 	if (arguments.size() < 2) {
 		throw BinderException("decision_tree requires a tree followed by at least one feature input, "
 		                      "e.g. decision_tree(tree, x::DOUBLE)");
@@ -1539,93 +1431,90 @@ static unique_ptr<FunctionData> BindDecisionTree(ClientContext &context, ScalarF
 		throw BinderException("decision_tree tree must be a constant expression that can be evaluated before reading "
 		                      "rows; table columns and subqueries are not supported");
 	}
-	auto &tree_type = arguments[0]->return_type;
+	auto &tree_type = arguments[0]->GetReturnType();
 	if (tree_type.id() != LogicalTypeId::STRUCT && tree_type.id() != LogicalTypeId::SQLNULL) {
 		throw BinderException("decision_tree tree must be a STRUCT with fields weights, thresholds, children, and "
 		                      "values; got %s",
-		                      arguments[0]->return_type.ToString());
+		                      arguments[0]->GetReturnType().ToString());
 	}
 
 	auto tree_value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
 	if (tree_value.IsNull()) {
 		// A typed NULL tree still determines the leaf type, but has no nodes to compile.
-		function.return_type = LogicalType::SQLNULL;
+		LogicalType return_type = LogicalType::SQLNULL;
 		if (tree_type.id() == LogicalTypeId::STRUCT) {
 			auto &fields = StructType::GetChildTypes(tree_type);
 			auto &values_type = fields[RequireStructField(fields, "values", "tree")].second;
 			if (values_type.id() == LogicalTypeId::LIST) {
-				function.return_type = ListType::GetChildType(values_type);
+				return_type = ListType::GetChildType(values_type);
 			} else if (values_type.id() == LogicalTypeId::ARRAY) {
-				function.return_type = ArrayType::GetChildType(values_type);
+				return_type = ArrayType::GetChildType(values_type);
 			} else {
 				throw BinderException("tree.values must be a list or array; got %s", values_type.ToString());
 			}
 		}
 		// Replace the whole invocation during binding, including nonconstant feature inputs.
-		function.SetBindExpressionCallback(BindNullDecisionTreeExpression);
-		return make_uniq<VariableReturnBindData>(function.return_type);
+		return make_uniq<BoundConstantExpression>(Value(return_type));
 	}
 	auto parsed_tree = ParseTreeValue(tree_value);
-	if (arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::LIST) {
+	if (arguments.size() == 2 && arguments[1]->GetReturnType().id() == LogicalTypeId::LIST) {
 		throw BinderException(
 		    "decision_tree feature input has type %s, a variable-length list. "
 		    "Use a fixed-size array, e.g. ::DOUBLE[%llu], or pass each feature as a separate argument",
-		    arguments[1]->return_type.ToString(), parsed_tree.coefficients[0].size());
+		    arguments[1]->GetReturnType().ToString(), parsed_tree.coefficients[0].size());
 	}
-	bool array_input = arguments.size() == 2 && arguments[1]->return_type.id() == LogicalTypeId::ARRAY;
+	bool array_input = arguments.size() == 2 && arguments[1]->GetReturnType().id() == LogicalTypeId::ARRAY;
 	idx_t dimensions;
 	vector<LogicalType> feature_types;
 	if (array_input) {
-		dimensions = ArrayType::GetSize(arguments[1]->return_type);
-		feature_types.push_back(ArrayType::GetChildType(arguments[1]->return_type));
+		dimensions = ArrayType::GetSize(arguments[1]->GetReturnType());
+		feature_types.push_back(ArrayType::GetChildType(arguments[1]->GetReturnType()));
 	} else {
 		dimensions = arguments.size() - 1;
 		feature_types.reserve(dimensions);
 		for (idx_t argument_idx = 1; argument_idx < arguments.size(); argument_idx++) {
-			feature_types.push_back(arguments[argument_idx]->return_type);
+			feature_types.push_back(arguments[argument_idx]->GetReturnType());
 		}
 	}
 	ValidateDimensions(parsed_tree, dimensions,
 	                   array_input ? "the feature array length" : "the number of feature arguments");
 
-	function.arguments.resize(arguments.size());
-	function.arguments[0] = arguments[0]->return_type;
-	Function::EraseArgument(function, arguments, 0);
-	auto computation_type = ConfigureTypes(context, function, parsed_tree, dimensions, array_input, feature_types);
-	auto compiled_tree = computation_type == LogicalType::DOUBLE ? CompileTree<double>(parsed_tree, dimensions)
-	                                                             : CompileTree<float>(parsed_tree, dimensions);
-	return make_uniq<DecisionTreeBindData>(std::move(compiled_tree), std::move(tree_value), computation_type);
+	auto computation_type = ResolveComputationType(context, parsed_tree, array_input, feature_types);
+	auto feature_type = array_input ? LogicalType::ARRAY(computation_type, dimensions) : computation_type;
+	arguments.erase(arguments.begin());
+	for (auto &argument : arguments) {
+		argument = BoundCastExpression::AddCastToType(context, std::move(argument), feature_type);
+	}
+	auto function = input.bound_function;
+	function.GetArguments().assign(arguments.size(), feature_type);
+	function.SetNamedArguments(arguments.size(), {});
+	auto bind_data = CompileDecisionTree(function, parsed_tree, std::move(tree_value));
+	return make_uniq<BoundFunctionExpression>(std::move(function), std::move(arguments), std::move(bind_data));
 }
 
 static void SerializeDecisionTree(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                                  const ScalarFunction &) {
+                                  const BoundScalarFunction &) {
 	D_ASSERT(bind_data);
 	auto &data = bind_data->Cast<DecisionTreeBindData>();
 	serializer.WriteProperty(100, "tree", data.tree_value);
 }
 
-static unique_ptr<FunctionData> DeserializeDecisionTree(Deserializer &deserializer, ScalarFunction &function) {
+static unique_ptr<FunctionData> DeserializeDecisionTree(Deserializer &deserializer, BoundScalarFunction &function) {
 	auto tree_value = deserializer.ReadProperty<Value>(100, "tree");
 	auto parsed_tree = ParseTreeValue(tree_value);
-	bool array_input = function.arguments.size() == 1 && function.arguments[0].id() == LogicalTypeId::ARRAY;
-	auto dimensions = array_input ? ArrayType::GetSize(function.arguments[0]) : function.arguments.size();
-	vector<LogicalType> feature_types;
-	if (array_input) {
-		feature_types.push_back(ArrayType::GetChildType(function.arguments[0]));
-	} else {
-		feature_types = function.arguments;
-	}
-	ValidateDimensions(parsed_tree, dimensions,
-	                   array_input ? "the feature array length" : "the number of feature arguments");
-	auto computation_type = ConfigureTypes(deserializer.Get<ClientContext &>(), function, parsed_tree, dimensions,
-	                                       array_input, feature_types);
-	auto compiled_tree = computation_type == LogicalType::DOUBLE ? CompileTree<double>(parsed_tree, dimensions)
-	                                                             : CompileTree<float>(parsed_tree, dimensions);
-	return make_uniq<DecisionTreeBindData>(std::move(compiled_tree), std::move(tree_value), computation_type);
+	return CompileDecisionTree(function, parsed_tree, std::move(tree_value));
 }
 
-static unique_ptr<FunctionData> BindFixedDepthTree(ClientContext &context, ScalarFunction &function,
-                                                   vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<ParsedExpression> UnbindDecisionTree(FunctionUnbindInput &input) {
+	auto &data = input.expression.BindInfo()->Cast<DecisionTreeBindData>();
+	input.children.insert(input.children.begin(), ConstantExpression::FromValue(data.tree_value));
+	return make_uniq<FunctionExpression>(input.expression.Function().GetDefinition()->GetQualifiedName(),
+	                                     std::move(input.children));
+}
+
+static unique_ptr<Expression> BindFixedDepthTreeExpression(FunctionBindExpressionInput &input) {
+	auto &context = input.context;
+	auto &arguments = input.children;
 	D_ASSERT(arguments.size() == 1);
 	if (arguments[0]->HasParameter()) {
 		throw ParameterNotResolvedException();
@@ -1634,22 +1523,14 @@ static unique_ptr<FunctionData> BindFixedDepthTree(ClientContext &context, Scala
 		throw BinderException("fixed_depth tree must be a constant expression that can be evaluated before reading "
 		                      "rows; table columns and subqueries are not supported");
 	}
-	if (arguments[0]->return_type.id() != LogicalTypeId::STRUCT) {
+	if (arguments[0]->GetReturnType().id() != LogicalTypeId::STRUCT) {
 		throw BinderException("fixed_depth tree must be a STRUCT with fields weights, thresholds, children, and "
 		                      "values; got %s",
-		                      arguments[0]->return_type.ToString());
+		                      arguments[0]->GetReturnType().ToString());
 	}
 
 	auto tree_value = MakeFixedDepthTreeValue(ExpressionExecutor::EvaluateScalar(context, *arguments[0]));
-	function.return_type = tree_value.type();
-	Function::EraseArgument(function, arguments, 0);
-	return make_uniq<FixedDepthTreeBindData>(std::move(tree_value));
-}
-
-static unique_ptr<Expression> BindFixedDepthTreeExpression(FunctionBindExpressionInput &input) {
-	D_ASSERT(input.bind_data);
-	auto &bind_data = input.bind_data->Cast<FixedDepthTreeBindData>();
-	return make_uniq<BoundConstantExpression>(std::move(bind_data.tree_value));
+	return make_uniq<BoundConstantExpression>(std::move(tree_value));
 }
 
 static void UnboundDecisionTree(DataChunk &, ExpressionState &, Vector &) {
@@ -1661,9 +1542,10 @@ static void UnboundFixedDepthTree(DataChunk &, ExpressionState &, Vector &) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	ScalarFunction function("decision_tree", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY,
-	                        UnboundDecisionTree, BindDecisionTree);
-	function.varargs = LogicalType::ANY;
+	ScalarFunction function("decision_tree", {}, LogicalType::ANY, UnboundDecisionTree);
+	function.GetSignature().AddArgs("arguments", LogicalType::ANY);
+	function.SetBindExpressionCallback(BindDecisionTreeExpression);
+	function.SetUnbindCallback(UnbindDecisionTree);
 	// The return type comes from the tree, so binding must happen before DuckDB folds a constant NULL feature.
 	// Bound invocations use default null handling.
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
@@ -1671,8 +1553,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.SetDeserializeCallback(DeserializeDecisionTree);
 	loader.RegisterFunction(function);
 
-	ScalarFunction fixed_depth_function("fixed_depth", {LogicalType::ANY}, LogicalType::ANY, UnboundFixedDepthTree,
-	                                    BindFixedDepthTree);
+	ScalarFunction fixed_depth_function("fixed_depth", {LogicalType::ANY}, LogicalType::ANY, UnboundFixedDepthTree);
 	fixed_depth_function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fixed_depth_function.SetBindExpressionCallback(BindFixedDepthTreeExpression);
 	loader.RegisterFunction(fixed_depth_function);

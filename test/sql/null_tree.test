@@ -5,7 +5,7 @@
 require apart
 
 statement ok
-PRAGMA verify_serializer
+SET debug_verify_serializer = true
 
 # Untyped NULL trees work with scalar features and fixed-size arrays.
 query III

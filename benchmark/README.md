@@ -27,6 +27,6 @@ python3 benchmark/run_matrix.py \
 
 Omit `--baseline-extension` and `--baseline-revision` to generate results without a comparison.
 
-The benchmark workflow runs after the existing extension build completes on `main`. It compares that build with the exact extension saved by the most recent successful benchmark workflow, loading both into the official DuckDB v1.5.4 shell. It builds nothing. Each results artifact includes the candidate extension so it can become the next baseline. When no baseline is available, the workflow publishes the candidate measurements without a comparison.
+The benchmark workflow runs after the existing extension build completes on `main`. It compares that build with the exact extension saved by the most recent successful benchmark workflow, loading both into the official DuckDB v2.0.0 shell. It builds nothing. Each results artifact includes the candidate extension so it can become the next baseline. When no baseline is available, or its DuckDB version differs from the current version, the workflow publishes the candidate measurements without a comparison.
 
 Published results are kept in the `benchmark-history` branch and served through GitHub Pages. The dashboard lists one result per revision; selecting a revision opens its report, which links back to the dashboard. Re-running a revision replaces its published result. The workflow creates the branch automatically on its first run.
